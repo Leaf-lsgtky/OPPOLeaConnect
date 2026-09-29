@@ -1,0 +1,18 @@
+# 逆向素材与工具本体都不入库（合计 ~21G，都是能从原始分区/官方包重取的）
+out/
+coloros_firmware/
+earbud_enco_x3/
+tools/
+phone_xiaomi/
+_index_bt.txt
+btsnoop_*.log
+
+# 构建产物
+module/*/build/
+module/*/*.apk
+module/*/*.idsig
+module/*/*.log
+
+# 其他
+.DS_Store
+*.bak
