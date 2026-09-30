@@ -113,6 +113,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         hookPolicyRepair(lpp.classLoader);
         hookClassicGate(lpp.classLoader);
         hookLeaEvents(lpp.classLoader);
+        hookReconnectEvents(lpp.classLoader);
         hookAdapterReady(lpp.classLoader);
     }
 
@@ -401,6 +402,11 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
      */
     private void gate(MethodHookParam p, String which, Object arg0) {
         try {
+            // 第二个参数是 isOutgoingRequest：绝不拦自己人主动发起的连接。
+            // 拦了就等于把补拨/用户在设置里点的那下连接吃掉（早拨"没收益"就是这么来的）
+            if (p.args.length > 1 && Boolean.TRUE.equals(p.args[1])) {
+                return;
+            }
             if (!(arg0 instanceof BluetoothDevice)) {
                 return;
             }
@@ -453,36 +459,112 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     }
 
     /**
-     * "开关蓝牙后永远连不上，只能回盒"的修法。
-     * 实测（11:55:44 进程起 -> 11:56:14 两只耳各一条 type=1 v1=0，正好 30 秒
-     * = LeAudioStateMachine.CONNECT_TIMEOUT）：重启后手机只拨 LE Audio，超时之后
-     * **没有任何人再去拨经典**；把模块 15 个开关全关掉做对照，同样一个 A2DP/Headset
-     * 状态机都不出现 —— 所以不是本模块的回归，是 HyperOS 自己不发这一下。
-     * 用户在设置里点"连接"（uid 1000 -> AdapterService.connectAllEnabledProfiles）能连上，
-     * 但必须等那次 LE 尝试失败之后再点才行 —— 说明耳机 page scan 是开的、可达的，
-     * 缺的就是这一下 BR/EDR 拨号。这里在那个失败事件上补掉它。
-     * 每个"适配器启动 / 链路曾经建立"的周期只拨一次（sWoke 在 onCreate 和
-     * deviceConnected 时清空）：当年"耳机合盖后还在不停尝试连接"就是因为定时重拨，
-     * 这次不想把同一个毛病带回来。
+     * 补拨的统一入口：把纯 LE 地址映射到那只经典设备，然后走一次全量连接
+     * （等价于用户在设置里点"连接"）。
+     *
+     * 只由事件驱动，没有任何定时器/间隔窗口：调用点是
+     *   - LE_AUDIO 这个 ProfileService 报"起好了"（onProfileServiceStateChanged，HyperOS 传 12）；
+     *   - PhonePolicy.autoConnect() / autoConnectLeAudio(dev)（系统自己发起回连的那一刻）；
+     *   - LE Audio 那一次尝试判死（native type=1 v1=0）与 deviceDisconnected；
+     *   - 耳机来向连接、用户在设置里主动点连接。
+     * 去重用 sWoke（每个适配器周期一条额度，连上任一 profile 就归还），不用"3 秒内不重复"这种时间窗口。
+     *
+     * 为什么要映射到经典地址：LE 断开事件经常落在纯 LE 的 46:3B 上，而 page 只对主耳那个
+     * 经典地址有用；v6.13 之前这里直接 return，等于那种情况下什么都没拨。
      */
-    private static void wakeClassic(BluetoothDevice dev, String why) {
-        if (!cfgBool("wake_classic", true) || sCtx == null) {
+    private static void connectNow(BluetoothDevice dev, String why) {
+        if (!cfgBool("wake_classic", true) || sCtx == null || dev == null) {
             return;
         }
-        if (a2dpConnected(dev) || hfpConnected(dev)) {
-            return;
-        }
+        BluetoothDevice target = dev;
         try {
             if (dev.getType() == BluetoothDevice.DEVICE_TYPE_LE) {
-                return;
+                target = findBondedClassicBud();
+                if (target == null) {
+                    log(why + "：" + dev + " 是纯 LE 地址，且找不到经典那只，放弃补拨");
+                    return;
+                }
             }
         } catch (Throwable ignored) {
         }
-        if (!sWoke.add(dev.getAddress())) {
+        if (a2dpConnected(target) || hfpConnected(target) || leaState(target) == LEA_CONNECTED) {
             return;
         }
-        log(why + "：经典不在线，补一次 connectAllEnabledProfiles（等价于设置里点连接）: " + dev);
-        invokeByName(sCtx, "connectAllEnabledProfiles", dev);
+        if (!sWoke.add(target.getAddress())) {
+            return;
+        }
+        repairClassicPolicy(target, why);
+        log(why + "：补一次全量连接（等价于设置里点连接）: " + target
+                + (target == dev ? "" : "（由 " + dev + " 映射）"));
+        invokeByName(sCtx, "connectAllEnabledProfiles", target);
+    }
+
+    /** 纯 LE 的那只耳没有经典链路，补拨要落到主耳那个经典地址上 */
+    private static BluetoothDevice findBondedClassicBud() {
+        if (sCtx == null) {
+            return null;
+        }
+        try {
+            Object bonded = invokeByName(sCtx, "getBondedDevices");
+            if (!(bonded instanceof java.util.Collection)) {
+                return null;
+            }
+            for (Object o : (java.util.Collection) bonded) {
+                if (!(o instanceof BluetoothDevice)) {
+                    continue;
+                }
+                BluetoothDevice d = (BluetoothDevice) o;
+                if (d.getType() == BluetoothDevice.DEVICE_TYPE_LE) {
+                    continue;
+                }
+                if (isBudNameless(d)) {
+                    return d;
+                }
+            }
+        } catch (Throwable t) {
+            log("findBondedClassicBud 异常: " + t);
+        }
+        return null;
+    }
+
+    /**
+     * 和 isBud 同一套判定，但启动期用：那时 dev.getName() 还是 null，
+     * 名字要改从栈自己的存储里拿（AdapterService.getRemoteName），再退到 getAlias。
+     * 实测 v6.13 在 onCreate 里"配对列表 3 个，认出耳机 0 个"，
+     * 连 holdGatt 都要等到第一次事件才挂得上 —— 而那几秒正是 4000ms 闲置拆链的窗口。
+     */
+    private static boolean isBudNameless(BluetoothDevice dev) {
+        String addr = dev.getAddress();
+        if (sBuds.contains(addr)) {
+            return true;
+        }
+        return budNameHit(dev) != null;
+    }
+
+    /** 命中就返回用到的名字来源，没命中返回 null（顺便记住地址，后面就不用再查） */
+    private static String budNameHit(BluetoothDevice dev) {
+        try {
+            String name = dev.getName();
+            String via = "getName";
+            if (name == null && sCtx != null) {
+                name = (String) invokeByName(sCtx, "getRemoteName", dev);
+                via = "getRemoteName";
+            }
+            if (name == null) {
+                name = (String) invokeByName(dev, "getAlias");
+                via = "getAlias";
+            }
+            if (name == null) {
+                return null;
+            }
+            String n = name.toUpperCase();
+            if (n.contains("OPPO") || n.contains("ONEPLUS") || n.contains("ENCO")) {
+                sBuds.add(dev.getAddress());
+                return via;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /** 一轮结束：LE 到手或断开，下一轮重新给 LE 机会 */
@@ -630,7 +712,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         sGameForced = false;
                         // 不在这里重新拦经典：否则 LE 一断就把经典饿死，形成"断开后不回连"
                         log("LE Audio 断开: " + dev + "，下一轮重新给 LE 机会");
-                        wakeClassic(dev, "LE Audio 断开（deviceDisconnected）");
+                        connectNow(dev, "LE Audio 断开（deviceDisconnected）");
                     }
                 }
             });
@@ -691,7 +773,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                                 endRound((BluetoothDevice) dev);
                                 forgetGatt(((BluetoothDevice) dev).getAddress());
                                 sGameForced = false;
-                                wakeClassic((BluetoothDevice) dev, "LE 那一次尝试失败");
+                                connectNow((BluetoothDevice) dev, "LE 那一次尝试失败");
                                     }
                         }
                     } catch (Throwable ignored) {
@@ -736,6 +818,103 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     + " forStream=" + invokeByName(leaSvc(), "isGroupAvailableForStream", gid));
         } catch (Throwable t) {
             log("adoptGroupContexts 异常: " + t);
+        }
+    }
+
+    /**
+     * 两个"系统自己准备回连"的时刻，加上一个"profile 服务起好了"的时刻，全部转成补拨。
+     * 全是事件，没有 postDelayed：以前用 600ms 延时等 profileServicesRunning，是定时器；
+     * 现在改成等 onProfileServiceStateChanged(LE_AUDIO, 12) 这个事件本身。
+     */
+    private void hookReconnectEvents(ClassLoader cl) {
+        Class<?> as;
+        try {
+            as = Class.forName(CL_AS, false, cl);
+        } catch (Throwable t) {
+            log("hook 跳过: 加载 AdapterService 失败 " + t);
+            return;
+        }
+        // HyperOS 把 ProfileService 挪到了 com.android.bluetooth.profile 包，
+        // 所以不写死类名，直接从方法表拿签名
+        Method ps = null;
+        for (Method c : as.getDeclaredMethods()) {
+            if (c.getName().equals("onProfileServiceStateChanged") && c.getParameterTypes().length == 2) {
+                ps = c;
+                break;
+            }
+        }
+        if (ps != null) {
+            de.robv.android.xposed.XposedBridge.hookMethod(ps, new Hook() {
+                @Override
+                protected void after(MethodHookParam p) {
+                    if (toInt(invokeByName(p.args[0], "getProfileId"), -1) != 22
+                            || !(p.args[1] instanceof Integer)) {
+                        return;
+                    }
+                    // 这里传的是 12=Starting、10=Stopping（AdapterService.java:6658-6672），
+                    // 不是 AOSP 的 STARTED=2 —— 写死 2 这个钩子永远不动
+                    if (((Integer) p.args[1]).intValue() != 12) {
+                        return;
+                    }
+                    Object bonded = invokeByName(sCtx, "getBondedDevices");
+                    if (!(bonded instanceof java.util.Collection)) {
+                        return;
+                    }
+                    for (Object o : (java.util.Collection) bonded) {
+                        if (o instanceof BluetoothDevice && isBudNameless((BluetoothDevice) o)) {
+                            connectNow((BluetoothDevice) o, "LE Audio profile 起好");
+                        }
+                    }
+                }
+            });
+            log("hook ok: AdapterService.onProfileServiceStateChanged");
+        } else {
+            log("hook 跳过: AdapterService.onProfileServiceStateChanged");
+        }
+
+        hookPolicy(cl, "autoConnect", null, "PhonePolicy.autoConnect", false);
+        hookPolicy(cl, "autoConnectLeAudio", BluetoothDevice.class, "PhonePolicy.autoConnectLeAudio", true);
+    }
+
+    /** PhonePolicy 的两个回连入口：after=系统自己那轮跑完再补，before=和它同时补 */
+    private void hookPolicy(ClassLoader cl, String name, Class<?> argType, String tag, final boolean withArg) {
+        try {
+            Class<?> pp = Class.forName("com.android.bluetooth.btservice.PhonePolicy", false, cl);
+            Method m = argType == null ? pp.getDeclaredMethod(name) : pp.getDeclaredMethod(name, argType);
+            de.robv.android.xposed.XposedBridge.hookMethod(m, new Hook() {
+                @Override
+                protected void after(MethodHookParam p) {
+                    if (withArg) {
+                        return;
+                    }
+                    Object bonded = invokeByName(sCtx, "getBondedDevices");
+                    if (!(bonded instanceof java.util.Collection)) {
+                        return;
+                    }
+                    for (Object o : (java.util.Collection) bonded) {
+                        if (o instanceof BluetoothDevice && isBudNameless((BluetoothDevice) o)) {
+                            connectNow((BluetoothDevice) o, tag);
+                        }
+                    }
+                }
+
+                @Override
+                protected void before(MethodHookParam p) {
+                    if (!withArg) {
+                        return;
+                    }
+                    for (int i = p.args.length - 1; i >= 0; i--) {
+                        if (p.args[i] instanceof BluetoothDevice
+                                && isBudNameless((BluetoothDevice) p.args[i])) {
+                            connectNow((BluetoothDevice) p.args[i], tag);
+                            return;
+                        }
+                    }
+                }
+            });
+            log("hook ok: " + tag);
+        } catch (Throwable t) {
+            log("hook 跳过: " + tag + " —— " + t);
         }
     }
 
@@ -895,25 +1074,18 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     // ---------------------------------------------------------------- 判定工具
 
     private static boolean isBud(BluetoothDevice dev) {
+        if (dev == null) {
+            return false;
+        }
         String addr = dev.getAddress();
         if (sBuds.contains(addr)) {
             return true;
         }
-        try {
-            String name = dev.getName();
-            if (name == null) {
-                return false;
-            }
-            String n = name.toUpperCase();
-            boolean hit = n.contains("OPPO") || n.contains("ONEPLUS") || n.contains("ENCODAIR");
-            if (hit) {
-                sBuds.add(addr);
-                holdGatt(dev);
-            }
-            return hit;
-        } catch (Throwable t) {
-            return false;
+        if (budNameHit(dev) != null) {
+            holdGatt(dev);
+            return true;
         }
+        return false;
     }
 
 
