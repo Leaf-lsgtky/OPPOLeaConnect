@@ -20,7 +20,7 @@ public class StatusActivity extends Activity {
 
     private static final Uri CFG = Uri.parse("content://" + ConfigProvider.AUTHORITY);
     private static final String[] KEYS = {"fix_policy", "le_first", "gate_hfp", "poke",
-            "hold_gatt", "adopt_ctx",
+            "hold_gatt", "adopt_ctx", "game_ctx", "wake_classic",
             "at", "vdsp", "vendor_id", "oesf_mask"};
 
     private TextView mStatus;
@@ -71,6 +71,31 @@ public class StatusActivity extends Activity {
                         + "做法是对每个 LE 地址做一次 direct connectGatt(TRANSPORT_LE) 且不 close。"
                         + "必须 direct —— opportunistic 不进 hold-link 表（BatteryService 就是这么漏掉的）。"
                         + "代价：这条 LE 链路进不了深睡，耗电略增。");
+        addSwitch(root, "wake_classic", "LE 尝试失败后补一次全量连接（修\"只能回盒\"）",
+                "开关蓝牙/重启蓝牙进程之后永远连不上、必须放回盒子再打开才行。实测：进程起来后手机"
+                        + "只拨 LE Audio，30 秒 LeAudioStateMachine.CONNECT_TIMEOUT 超时（11:55:44 起、"
+                        + "11:56:14 两只耳各一条 type=1 v1=0），**之后没有任何人再去拨经典**；"
+                        + "把本模块 15 个开关全关掉做对照，dumpsys 里一个 A2DP/Headset 状态机都不出现，"
+                        + "所以不是本模块的回归，是 HyperOS 自己不发这一下。而你在设置里点\"连接\""
+                        + "（uid 1000 -> AdapterService.connectAllEnabledProfiles）能连上，"
+                        + "但必须等那次 LE 尝试失败之后再点才行 —— 说明耳机 page scan 开着、是可达的，"
+                        + "缺的就是这一下 BR/EDR 拨号。这里在同一个失败事件上补掉它。"
+                        + "每个\"适配器启动 / 链路曾建立\"的周期只拨一次（sWoke 在 onCreate 和 "
+                        + "deviceConnected 时清空）：当年\"耳机合盖后还在不停尝试连接\"就是定时重拨造成的，"
+                        + "这次不留同一个毛病。");
+        addSwitch(root, "game_ctx", "把手机状态置成\"游戏在场\"（拿低延迟 CC）",
+                "LE Audio 的低延迟档只有手机认为前台是游戏时才拿得到：全进程唯一入口是 "
+                        + "LeAudioService.processGameImportanceChange() -> mNativeInterface.setInGame(true)，"
+                        + "门槛是 isGameApplication(uid) 用 PackageManager 的 App 类目判定，音乐类 App 永远进不来。"
+                        + "于是 context 停在 MEDIA，而 HyperOS 的 "
+                        + "/apex/com.android.bt/etc/bluetooth/le_audio/audio_set_scenarios.json 里 Media 场景"
+                        + "65 条候选没有一条 Low_Latency —— 实测只能拿到 VND_QoS_Config_R13_L100"
+                        + "（RTN13/MTL100ms，栈算出传输延迟 84.69ms，加 presentation delay 40ms，"
+                        + "手机上报 Audio HAL 的 peerDelayUs=124000），和 AAC 的 150-200ms 只差几十毫秒。"
+                        + "Game 场景里的 Two-OneChan-SnkAse-Lc3_48_1_Low_Latency 是 7.5ms framing/RTN3/MTL8ms。"
+                        + "这里赶在 codec configure 之前走同一个 native 入口，让栈按 Game 场景挑档。"
+                        + "代价：每耳码率从 155 octets(124kbps) 降到 75 octets(60kbps)，音质要自己听；"
+                        + "关掉时会显式还原（系统的游戏跟踪列表始终为空，它不会替我们调回 false）。");
         root.addView(header("OPPO 私有厂商 AT 通道"));
         addSwitch(root, "at", "应答厂商 AT",
                 "耳机每次回连都会问 AT+VDID=? / +VDSF= / +OESF=，按 ColorOS 口径回答"
@@ -126,7 +151,9 @@ public class StatusActivity extends Activity {
 
     /** 只有 gate_hfp 默认关：拒掉主耳用来协调 TWS 的经典 HFP 会出现只有一只耳有声 */
     private static boolean def(String key) {
-        return !"gate_hfp".equals(key);
+        // game_ctx 默认关：它换到的是 7.5ms/75octs 的档，每耳码率从 124kbps 掉到 60kbps，
+        // 值不值要耳朵说了算，不该由模块替用户默认打开。
+        return !("gate_hfp".equals(key) || "game_ctx".equals(key));
     }
 
     private void addText(LinearLayout parent, final String key, String title, String def) {

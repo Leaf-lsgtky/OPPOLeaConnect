@@ -67,6 +67,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static boolean sGateHfp = false;
     private static boolean sPoke = true;
     private static boolean sAdoptCtx = true;
+    /** 我们替系统把"游戏在场"置起来了 —— 关掉开关时要靠它决定是否需要还原 */
+    private static boolean sGameForced = false;
     private static int sOesfMask = 0x3F;
     private static String sVendorId = "1946";
     private static String sVdsf = "7";
@@ -89,6 +91,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final Set<String> sUserOffHfp = new HashSet<String>();
     private static final Set<String> sBuds = new HashSet<String>();
     private static final Set<String> sActed = new HashSet<String>();
+    /** 本周期已经补拨过经典的地址（onCreate / LE 到手时清空） */
+    private static final Set<String> sWoke = new HashSet<String>();
     /** 当前音频面：addr -> "brd"（引导，经典允许） / "lea"（LE Audio 独占） */
     /** 地址 -> 我们挂上去的 BluetoothGatt（只为占住 hold-link，永不 close） */
     private static final Map<String, Object> sHeld = new HashMap<String, Object>();
@@ -448,6 +452,39 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         log("拒绝 " + which + "（" + why + "）: " + dev);
     }
 
+    /**
+     * "开关蓝牙后永远连不上，只能回盒"的修法。
+     * 实测（11:55:44 进程起 -> 11:56:14 两只耳各一条 type=1 v1=0，正好 30 秒
+     * = LeAudioStateMachine.CONNECT_TIMEOUT）：重启后手机只拨 LE Audio，超时之后
+     * **没有任何人再去拨经典**；把模块 15 个开关全关掉做对照，同样一个 A2DP/Headset
+     * 状态机都不出现 —— 所以不是本模块的回归，是 HyperOS 自己不发这一下。
+     * 用户在设置里点"连接"（uid 1000 -> AdapterService.connectAllEnabledProfiles）能连上，
+     * 但必须等那次 LE 尝试失败之后再点才行 —— 说明耳机 page scan 是开的、可达的，
+     * 缺的就是这一下 BR/EDR 拨号。这里在那个失败事件上补掉它。
+     * 每个"适配器启动 / 链路曾经建立"的周期只拨一次（sWoke 在 onCreate 和
+     * deviceConnected 时清空）：当年"耳机合盖后还在不停尝试连接"就是因为定时重拨，
+     * 这次不想把同一个毛病带回来。
+     */
+    private static void wakeClassic(BluetoothDevice dev, String why) {
+        if (!cfgBool("wake_classic", true) || sCtx == null) {
+            return;
+        }
+        if (a2dpConnected(dev) || hfpConnected(dev)) {
+            return;
+        }
+        try {
+            if (dev.getType() == BluetoothDevice.DEVICE_TYPE_LE) {
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+        if (!sWoke.add(dev.getAddress())) {
+            return;
+        }
+        log(why + "：经典不在线，补一次 connectAllEnabledProfiles（等价于设置里点连接）: " + dev);
+        invokeByName(sCtx, "connectAllEnabledProfiles", dev);
+    }
+
     /** 一轮结束：LE 到手或断开，下一轮重新给 LE 机会 */
     private static void endRound(BluetoothDevice dev) {
         String addr = dev.getAddress();
@@ -498,6 +535,55 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * LE Audio 的低延迟档只有"手机认为前台是游戏"时才拿得到。全进程唯一的入口是
+     * LeAudioService.processGameImportanceChange() -> mNativeInterface.setInGame(true)
+     * （le_audio/LeAudioService.java:4104-4142），而它的门槛 isGameApplication(uid)
+     * 用的是 PackageManager 给的 App 类目（:3183）—— 音乐类 App 不是游戏，于是
+     * context 一直停在 MEDIA；而 HyperOS 的
+     * /apex/com.android.bt/etc/bluetooth/le_audio/audio_set_scenarios.json 里
+     * Media 场景 65 条候选没有一条 Low_Latency，实测只能拿到
+     * VND_QoS_Config_R13_L100（RTN13 / MTL100ms，栈自己算出的传输延迟 84.69ms，
+     * 加上 presentation delay 40ms => 手机上报 Audio HAL 的 peerDelayUs=124000），
+     * 与 AAC 的 150-200ms 只差几十毫秒，所以听着"和 AAC 差不多"。
+     * Game 场景里的 Two-OneChan-SnkAse-Lc3_48_1_Low_Latency 才是 7.5ms framing /
+     * RTN3 / MTL8ms。这里走同一个 native 入口把"游戏在场"置起来，让栈按 Game 场景挑 CC。
+     * 关掉时必须显式还原：我们是直接调 native 的，系统的游戏跟踪列表始终为空，
+     * 它自己不会再调 setInGame(false)。
+     */
+    private static void applyGameCtx(String why) {
+        Object lea = leaSvc();
+        if (lea == null) {
+            return;
+        }
+        boolean on = cfgBool("game_ctx", false);
+        if (!on && !sGameForced) {
+            return;
+        }
+        Object ni = objVal(lea, "mNativeInterface");
+        if (ni == null || pickMethod(ni.getClass(), "setInGame", new Object[]{Boolean.TRUE}) == null) {
+            log("game_ctx 跳过: " + (ni == null ? "拿不到 LeAudioService.mNativeInterface"
+                    : ni.getClass().getName() + " 里没有 setInGame(boolean)"));
+            return;
+        }
+        try {
+            int gid = toInt(invokeByName(lea, "getActiveGroupId"), -1);
+            if (on) {
+                Object sup = invokeByName(lea, "getGroupSupportGameContext", Integer.valueOf(gid));
+                invokeByName(ni, "setInGame", Boolean.TRUE);
+                sGameForced = true;
+                log(why + "：setInGame(true) 组=" + gid + " 支持 GAME context=" + sup
+                        + "（不置它只能在 Media 场景里挑，那边没有 Low_Latency）");
+            } else {
+                invokeByName(ni, "setInGame", Boolean.FALSE);
+                sGameForced = false;
+                log(why + "：setInGame(false) 交还给系统自己的游戏跟踪");
+            }
+        } catch (Throwable t) {
+            log("game_ctx 异常: " + t);
+        }
+    }
+
     // ------------------------------------ 3) LE Audio 事件：连上/断开/native 上下文
 
     private void hookLeaEvents(ClassLoader cl) {
@@ -510,7 +596,12 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         BluetoothDevice dev = (BluetoothDevice) p.args[0];
                         log("LE Audio 已连接（deviceConnected）: " + dev);
                         endRound(dev);
+                        // LE 到手了，这个地址的补拨额度重置（下次真断开还可以再拨一次）
+                        sWoke.remove(dev.getAddress());
                         holdGatt(dev);
+                        // 必须赶在流起来之前：CC/QoS 是在 codec configure 时按场景表挑的，
+                        // 等组 ACTIVE（type=2）再置就晚了一整轮
+                        applyGameCtx("LE Audio 连接");
                         if (cfgBool("adopt_ctx", true) && sAdoptedMask != 0) {
                             adoptGroupContexts(dev);
                         }
@@ -536,8 +627,10 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         BluetoothDevice dev = (BluetoothDevice) p.args[0];
                         sActed.remove(dev.getAddress());
                         endRound(dev);
+                        sGameForced = false;
                         // 不在这里重新拦经典：否则 LE 一断就把经典饿死，形成"断开后不回连"
                         log("LE Audio 断开: " + dev + "，下一轮重新给 LE 机会");
+                        wakeClassic(dev, "LE Audio 断开（deviceDisconnected）");
                     }
                 }
             });
@@ -589,6 +682,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         if (type == 2 && intVal(e, "valueInt2") == 1) {
                             // 组变 ACTIVE 是"lead 可查了"的时刻；deviceConnected 里那次可能早了一拍
                             setActiveLead();
+                            applyGameCtx("组 ACTIVE");
                         }
                         if (type == 1 && intVal(e, "valueInt1") == 0) {
                             Object dev = objVal(e, "device");
@@ -596,6 +690,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                                 log("LE Audio 断开（native 事件）: " + dev);
                                 endRound((BluetoothDevice) dev);
                                 forgetGatt(((BluetoothDevice) dev).getAddress());
+                                sGameForced = false;
+                                wakeClassic((BluetoothDevice) dev, "LE 那一次尝试失败");
                                     }
                         }
                     } catch (Throwable ignored) {
@@ -661,6 +757,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     sHsRef = unwrapOptional(invokeByName(as, "getHeadsetService"));
                     sLeaRef = unwrapOptional(invokeByName(as, "getLeAudioService"));
                     refreshConfig();
+                    sWoke.clear();
                     log("AdapterService 就绪：" + configLine());
                     // 提前给已配对的耳机注册 interop：闲置定时器是在 LE 链路建好后 4 秒内装的，
                     // 等到第一次事件再认就晚了
