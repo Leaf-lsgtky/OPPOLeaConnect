@@ -467,10 +467,28 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                 log("组还没配齐（allLeAudioDevicesConnected=" + all + "），先不 setActiveDevice");
                 return;
             }
-            Object gid = invokeByName(leaSvc(), "getActiveGroupId");
-            Object lead = gid == null ? null : invokeByName(leaSvc(), "getConnectedGroupLeadDevice", gid);
+            int gid = toInt(invokeByName(leaSvc(), "getActiveGroupId"), -1);
+            if (gid < 0) {
+                // 组刚连上但还没被标成 active 时 getActiveGroupId() 是 -1（实测 08:20:48
+                // 就是这样跳过过，结果 Active config 一直 Not set、CIG 不建）——
+                // 退而用成员自己的 groupId 查，等 GROUP_STATUS_ACTIVE 事件再试一次
+                for (String a : sBuds) {
+                    Object d = sCtx == null ? null : invokeByName(sCtx, "getRemoteDevice", a);
+                    if (d instanceof BluetoothDevice) {
+                        gid = toInt(invokeByName(leaSvc(), "getGroupId", d), -1);
+                        if (gid >= 0) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if (gid < 0) {
+                log("拿不到组号，跳过 setActiveDevice");
+                return;
+            }
+            Object lead = invokeByName(leaSvc(), "getConnectedGroupLeadDevice", Integer.valueOf(gid));
             if (!(lead instanceof BluetoothDevice)) {
-                log("拿不到组的 lead，跳过 setActiveDevice");
+                log("组 " + gid + " 里拿不到 lead，跳过 setActiveDevice");
                 return;
             }
             log("setActiveDevice(组的 lead/主耳): " + lead);
@@ -568,6 +586,10 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         // 掉线必须挂在这个 native 事件上：LeAudioService.deviceDisconnected(dev,boolean)
                         // 在"LE ACL 被栈闲置拆掉"这条路径上不会被调用（实测 05:09:10.339 只有
                         // type=1 v1=0，没有 deviceDisconnected），挂它会漏掉正要补拨的那次。
+                        if (type == 2 && intVal(e, "valueInt2") == 1) {
+                            // 组变 ACTIVE 是"lead 可查了"的时刻；deviceConnected 里那次可能早了一拍
+                            setActiveLead();
+                        }
                         if (type == 1 && intVal(e, "valueInt1") == 0) {
                             Object dev = objVal(e, "device");
                             if (dev instanceof BluetoothDevice && isBud((BluetoothDevice) dev)) {

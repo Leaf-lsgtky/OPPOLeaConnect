@@ -13,8 +13,8 @@ DEX=$OUT/dex
 KEY=$DIR/keystore/oppoemu.keystore
 MINSDK=26
 TGTSDK=34
-VERCODE=64
-VERNAME=6.4
+VERCODE=65
+VERNAME=6.5
 
 rm -rf "$OUT"; mkdir -p "$CLASSES" "$DEX"
 
