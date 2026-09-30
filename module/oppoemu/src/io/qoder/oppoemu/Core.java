@@ -916,6 +916,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         }
     }
 
+
+
     /** 用户是否想要 LE Audio：策略允许 且 没在设置里手动关掉 */
     /** LE Audio 服务实例。AdapterService.onCreate 时它常常还没起来
      *  （getLeAudioService() 返回 Optional.empty），所以每次用之前补取一次。 */
