@@ -88,8 +88,10 @@ public class StatusActivity extends Activity {
                         + "，所以只拨有 BR/EDR 链路密钥的那只（地址认 HFP 的 AT 交互，落盘在"
                         + " oppoemu_buds：开关蓝牙每次都是全新的 com.android.bluetooth 进程，纯内存的"
                         + "地址表开机瞬间认不出耳机就一次都不会拨，19:26 那轮就是这么漏的）。"
-                        + "判死/断开那两条每周期只拨一次（sWoke 在 onCreate 和 deviceConnected 清空）："
-                        + "当年\"耳机合盖后还在不停尝试连接\"就是定时重拨造成的，这次不留同一个毛病。");
+                        + "判死/断开那两条已删（v6.18）：LE 一断就补拨，对手机来说分不清\"耳机睡了\""
+                        + "和\"链路意外掉了\"，实测合盖后 22:52:09、22:52:26、22:59:12 连着三次隔着"
+                        + "关死的盒子 page。开关蓝牙那一轮 profile-ON 和 PhonePolicy.autoConnect "
+                        + "两处已经够（22:49:30、22:51:55 两次都是它们先拨中的）。");
         addSwitch(root, "game_ctx", "把手机状态置成\"游戏在场\"（拿低延迟 CC）",
                 "LE Audio 的低延迟档只有手机认为前台是游戏时才拿得到：全进程唯一入口是 "
                         + "LeAudioService.processGameImportanceChange() -> mNativeInterface.setInGame(true)，"

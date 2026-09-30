@@ -475,14 +475,12 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
      * 补拨的统一入口：把事件里的地址换成那只经典设备，然后走一次全量连接
      * （等价于用户在设置里点"连接"）。
      *
-     * 只由事件驱动，没有任何定时器/间隔窗口：调用点是
-     *   - 每个 ProfileService 报"起好了"（onProfileServiceStateChanged，HyperOS 传 12=ON）；
-     *   - PhonePolicy.autoConnect() / autoConnectLeAudio(dev)（系统自己发起回连的那一刻）；
-     *   - LE Audio 那一次尝试判死（native type=1 v1=0）与 deviceDisconnected；
-     *   - 耳机来向连接、用户在设置里主动点连接。
-     * 失败/断开那几条走 sWoke（每个适配器周期一条额度，连上任一 profile 就归还）；
-     * profile 起好这条不占额度 —— 它靠"经典还没连上"这个状态自己收口，
-     * 不用"3 秒内不重复"这种时间窗口。
+     * 只由事件驱动，没有任何定时器/间隔窗口：调用点只有两处，都在"手机自己刚启动"那一侧 ——
+     *   - 每个 ProfileService 报到 12=ON（onProfileServiceStateChanged）；
+     *   - PhonePolicy.autoConnect() / autoConnectLeAudio(dev)（系统自己发起回连的那一刻）。
+     * 两边都不占 sWoke 额度：profile 那条靠"经典还没连上 + profile 服务已起齐"两个状态自己收口，
+     * PhonePolicy 那条每周期一次（sWoke 在 onCreate 和 deviceConnected 时清）。
+     * 判死/断开那两类事件以前也挂在这里，v6.18 删了：合盖后它们会连着几次把经典往关死的盒子里 page。
      *
      * 为什么要换成经典地址：LE 断开事件经常落在纯 LE 的 46:3B 上，而 page 只对主耳那个
      * 经典地址有用；更关键的是 HyperOS 在 btservice/AdapterService.java:2409-2411 对
@@ -800,9 +798,13 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         sActed.remove(dev.getAddress());
                         endRound(dev);
                         sGameForced = false;
-                        // 不在这里重新拦经典：否则 LE 一断就把经典饿死，形成"断开后不回连"
+                        // 不在这里重新拦经典：否则 LE 一断就把经典饿死，形成"断开后不回连"。
+                        // 也不在这里补拨：LE 断开对手机来说分不清"耳机睡了（合盖）"和
+                        // "链路意外掉了"，实测合盖后 22:52:09/22:52:26/22:59:12 三次
+                        // "LE 那一次尝试失败"补拨就是隔着关死的盒子 page。开关蓝牙那一轮
+                        // 由 profile-ON 事件和 PhonePolicy.autoConnect 两处覆盖（22:49:30、
+                        // 22:51:55 两次都是它们先拨中的），这里删掉不影响那个修复。
                         log("LE Audio 断开: " + dev + "，下一轮重新给 LE 机会");
-                        connectNow(dev, "LE Audio 断开（deviceDisconnected）", true);
                     }
                 }
             });
@@ -863,8 +865,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                                 endRound((BluetoothDevice) dev);
                                 forgetGatt(((BluetoothDevice) dev).getAddress());
                                 sGameForced = false;
-                                connectNow((BluetoothDevice) dev, "LE 那一次尝试失败", true);
-                                    }
+                            }
                         }
                     } catch (Throwable ignored) {
                     }

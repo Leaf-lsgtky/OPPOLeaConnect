@@ -12,7 +12,14 @@ module/*/build/
 module/*/*.apk
 module/*/*.idsig
 module/*/*.log
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
 
 # 其他
 .DS_Store
 *.bak
+OPPOLeaConnect/
