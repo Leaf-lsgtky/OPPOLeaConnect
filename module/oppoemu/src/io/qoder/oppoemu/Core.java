@@ -10,6 +10,7 @@ import android.os.Looper;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -92,6 +93,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final Set<String> sUserOffA2dp = new HashSet<String>();
     private static final Set<String> sUserOffHfp = new HashSet<String>();
     private static final Set<String> sBuds = new HashSet<String>();
+    /** 用户在本进程里主动断开过的耳机（按组记地址）：不再补拨、不占链路、不放行来向 */
+    private static final Set<String> sUserDisc = new HashSet<String>();
     /** 有 BR/EDR 链路密钥的那只（经典腿只能拨它）—— 落盘，开关蓝牙后新进程也认得 */
     private static String sClassicAddr;
     private static final Set<String> sActed = new HashSet<String>();
@@ -420,6 +423,10 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             if (!isBud(dev)) {
                 return;
             }
+            if (isUserDisc(dev)) {
+                refuse(p, dev, which, "用户在设置里主动断开过");
+                return;
+            }
             repairClassicPolicy(dev, which + " 来向");
             if (!cfgBool("le_first", true) || !wantLea(dev)) {
                 return;
@@ -494,6 +501,10 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             return;
         }
         if (a2dpConnected(target) || hfpConnected(target) || leaState(target) == LEA_CONNECTED) {
+            return;
+        }
+        if (isUserDisc(target) || isUserDisc(dev)) {
+            log(why + "：用户在设置里主动断开过，不补拨");
             return;
         }
         // AdapterService.java:2397-2401：profile 服务没起齐时 connectAllEnabledProfiles
@@ -1011,6 +1022,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     sLeaRef = unwrapOptional(invokeByName(as, "getLeAudioService"));
                     refreshConfig();
                     sWoke.clear();
+                    clearUserDisc("蓝牙进程重启");
                     loadBuds();
                     log("AdapterService 就绪：" + configLine());
                     // 提前给已配对的耳机注册 interop：闲置定时器是在 LE 链路建好后 4 秒内装的，
@@ -1053,11 +1065,80 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             protected void before(MethodHookParam p) {
                 Object arg0 = p.args[0];
                 if (arg0 instanceof BluetoothDevice && isBud((BluetoothDevice) arg0)) {
+                    int uid = android.os.Binder.getCallingUid();
+                    if (!BT_UID.equals(String.valueOf(uid))) {
+                        clearUserDisc("用户主动发起全量连接(uid=" + uid + ")");
+                    }
                     repairClassicPolicy((BluetoothDevice) arg0, "全量连接");
                 }
             }
         });
         log("hook ok: AdapterService.connectAllEnabledProfiles 修经典策略");
+
+        Method md = findMethod(cl, CL_AS, "disconnectAllEnabledProfiles",
+                BluetoothDevice.class, int.class);
+        if (md == null) {
+            log("hook 跳过: AdapterService.disconnectAllEnabledProfiles");
+            return;
+        }
+        de.robv.android.xposed.XposedBridge.hookMethod(md, new Hook() {
+            @Override
+            protected void before(MethodHookParam p) {
+                Object arg0 = p.args[0];
+                if (!(arg0 instanceof BluetoothDevice) || !isBud((BluetoothDevice) arg0)) {
+                    return;
+                }
+                int uid = android.os.Binder.getCallingUid();
+                if (BT_UID.equals(String.valueOf(uid))) {
+                    return;
+                }
+                markUserDisc((BluetoothDevice) arg0, "设置里点断开(uid=" + uid + ")");
+            }
+        });
+        log("hook ok: AdapterService.disconnectAllEnabledProfiles 记用户主动断开");
+    }
+
+    /**
+     * 用户在设置里点"断开"之后，手机就不该再把这对耳拨回来。
+     *
+     * 实测这条和"关低功耗音频"是两条完全不同的路：断开走
+     * btservice/AdapterServiceBinder.disconnectAllEnabledProfiles（19:59:21.220，
+     * uid/pid=1000/28479 packageName=com.android.settings），经
+     * CachedBluetoothDevice.disconnect 下来，**不碰 setConnectionPolicy**，所以
+     * sUserOffLea/sUserOffA2dp 那三个"用户在设置里关的"标记一个都不会被点亮 ——
+     * 于是我们的补拨、hold_gatt、来向放行全都照常工作，把用户那一下断开当成链路意外掉了。
+     * 栈自己也认为这是"别再自动连"：native 在同一毫秒就打了
+     * system/bta/le_audio/client.cc:3031 "Disconnect: Removing autoconnect flag for group_id 1"。
+     *
+     * 更糟的是它还会自激：我们 45ms 后把经典拨起来，HyperOS 一见 A2DP/HFP 在线就把 LE 拆掉
+     * （"processProfileStateChanged: A2DP/HFP connected disconnect lea"），LE 一断我们又拨经典，
+     * 19:59:21~41 那 20 秒里两只耳在 CONNECTED/CONNECTING 之间翻转了七八轮。
+     *
+     * 标记按组记：断开请求只落在 46:3B 上，而补拨用的是经典那只 6E:5A，只记一个地址等于没记。
+     * 清除时机：用户在设置里再点一次"连接"（同一个 uid!=1002 的判据），或蓝牙进程重启。
+     */
+    private static void markUserDisc(BluetoothDevice dev, String why) {
+        sUserDisc.add(dev.getAddress());
+        for (String a : new ArrayList<String>(sBuds)) {
+            sUserDisc.add(a);
+        }
+        log(why + "：本进程内不再补拨/占链路/放行来向，地址=" + sUserDisc);
+        releaseHeld(dev.getAddress());
+        for (String a : new ArrayList<String>(sHeld.keySet())) {
+            releaseHeld(a);
+        }
+    }
+
+    private static void clearUserDisc(String why) {
+        if (sUserDisc.isEmpty()) {
+            return;
+        }
+        log(why + "：清除主动断开标记 " + sUserDisc);
+        sUserDisc.clear();
+    }
+
+    private static boolean isUserDisc(BluetoothDevice dev) {
+        return !sUserDisc.isEmpty() && dev != null && sUserDisc.contains(dev.getAddress());
     }
 
     private static void repairClassicPolicy(BluetoothDevice dev, String why) {
@@ -1113,8 +1194,9 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         boolean on = cfgBool("hold_gatt", true);
         boolean lea = wantLea(dev);
         log("holdGatt 检查 " + addr + "：开关=" + on + " sCtx=" + (sCtx != null)
-                + " wantLea=" + lea + " 用户关LEA=" + sUserOffLea.contains(addr));
-        if (!on || sCtx == null || !lea) {
+                + " wantLea=" + lea + " 用户关LEA=" + sUserOffLea.contains(addr)
+                + " 用户主动断开=" + isUserDisc(dev));
+        if (!on || sCtx == null || !lea || isUserDisc(dev)) {
             return;
         }
         try {
@@ -1138,6 +1220,25 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     /** 链路没了就把持有者忘掉，下一次连上重新挂 —— 不主动 close，close 本身就是扳机 */
     private static void forgetGatt(String addr) {
         sHeld.remove(addr);
+    }
+
+    /**
+     * 但用户主动断开时这枚扳机必须扣：这个 GATT 客户端唯一的用处就是把
+     * gatt_update_app_hold_link_status 的名额占住（LE 链路建好后 4 秒的闲置拆链就是被它顶掉的），
+     * 用户点了断开还占着，等于我们替他把链路又摁回去。disconnect+close 之后名额才真正释放。
+     */
+    private static void releaseHeld(String addr) {
+        Object g = sHeld.remove(addr);
+        if (g == null) {
+            return;
+        }
+        try {
+            invokeByName(g, "disconnect");
+            invokeByName(g, "close");
+            log("已释放 GATT 持有者: " + addr);
+        } catch (Throwable t) {
+            log("释放 GATT 持有者异常: " + t);
+        }
     }
 
     /** 空回调：这个客户端唯一的用途就是占住 gatt_update_app_hold_link_status 的名额 */
