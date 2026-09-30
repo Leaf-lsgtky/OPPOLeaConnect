@@ -20,7 +20,7 @@ public class StatusActivity extends Activity {
 
     private static final Uri CFG = Uri.parse("content://" + ConfigProvider.AUTHORITY);
     private static final String[] KEYS = {"fix_policy", "le_first", "gate_hfp", "poke",
-            "hold_gatt", "adopt_ctx", "plane_flip",
+            "hold_gatt", "adopt_ctx",
             "at", "vdsp", "vendor_id", "oesf_mask"};
 
     private TextView mStatus;
@@ -71,13 +71,6 @@ public class StatusActivity extends Activity {
                         + "做法是对每个 LE 地址做一次 direct connectGatt(TRANSPORT_LE) 且不 close。"
                         + "必须 direct —— opportunistic 不进 hold-link 表（BatteryService 就是这么漏掉的）。"
                         + "代价：这条 LE 链路进不了深睡，耗电略增。");
-        addSwitch(root, "plane_flip", "互斥时序：经典只引导，用完让位给 LC3",
-                "照 ColorOS 的时序走：立引导面（a2dp/hfp=ALLOWED、le_audio=FORBIDDEN）→ 显式拨经典拿"
-                        + " HFP SLC → 发 +VDSP=1,1 把耳机的音频面翻到 LE Audio → 经典让位"
-                        + "（a2dp/hfp=FORBIDDEN 并断 profile）→ 逐个成员连 LE Audio。"
-                        + "每个地址最多重试 3 次，LE 面没了会自动退回引导面。"
-                        + "关掉它就是保底 AAC 路线（经典两只耳都响）。");
-
         root.addView(header("OPPO 私有厂商 AT 通道"));
         addSwitch(root, "at", "应答厂商 AT",
                 "耳机每次回连都会问 AT+VDID=? / +VDSF= / +OESF=，按 ColorOS 口径回答"
@@ -131,9 +124,9 @@ public class StatusActivity extends Activity {
         parent.addView(row);
     }
 
-    /** 只有这两个默认关：gate_hfp 会饿死主耳靠经典 HFP 的 TWS 协调，dual_mode 会废掉手机端主动连经典 */
+    /** 只有 gate_hfp 默认关：拒掉主耳用来协调 TWS 的经典 HFP 会出现只有一只耳有声 */
     private static boolean def(String key) {
-        return !"gate_hfp".equals(key) && !"dual_mode".equals(key);
+        return !"gate_hfp".equals(key);
     }
 
     private void addText(LinearLayout parent, final String key, String title, String def) {

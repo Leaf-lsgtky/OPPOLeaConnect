@@ -50,7 +50,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     /** BluetoothProfile 的 profile id：connectEnabledProfiles 里 A2DP=2、HFP=1 */
     private static final int PROFILE_A2DP = 2;
     private static final int PROFILE_HFP = 1;
-    private static final int PROFILE_LE_AUDIO = 22;
 
     /** LeAudioStateMachine.getConnectionState() 只用 BluetoothProfile 那四个值（0/1/2/3） */
     private static final int LEA_DISCONNECTED = 0;
@@ -91,11 +90,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final Set<String> sBuds = new HashSet<String>();
     private static final Set<String> sActed = new HashSet<String>();
     /** 当前音频面：addr -> "brd"（引导，经典允许） / "lea"（LE Audio 独占） */
-    private static final Map<String, String> sPlane = new HashMap<String, String>();
     /** 地址 -> 我们挂上去的 BluetoothGatt（只为占住 hold-link，永不 close） */
     private static final Map<String, Object> sHeld = new HashMap<String, Object>();
-    private static final Map<String, Integer> sBootTries = new HashMap<String, Integer>();
-    private static final int MAX_BOOTSTRAP = 3;
 
     @Override
     public void handleLoadPackage(final de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam lpp) {
@@ -184,7 +180,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
      * A2dpService.java:1260-1266 / HeadsetService.java:1032-1038 的 CSIP 拒绝分支永远成立 ——
      * 手机端所有主动 connect() 必被拒，还把刚建好的经典 ACL 因"没有 profile 通道"闲置拆掉
      * （实测 04:40:22.824 -> 04:40:23.167、04:48:05.102 -> 04:48:05.602）。
-     * 现在的模型是"经典只用于引导，翻面之后就让位给 LE Audio"，见 plane_flip。
+     * 现在的模型：LE Audio 与经典同时可拨，谁先上来由栈自己定，模块只保住策略不被写死。
      */
 
     // ------------------------------------------------- 1) OPPO 私有厂商 AT 通道
@@ -281,7 +277,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                             // ColorOS 的时序：+VDSP 是"把耳机的音频面翻到 LE Audio"的命令，
                             // 翻完就该让经典让位（OplusLeAudioServiceExt.java:328-334 发命令、
                             // OplusPhonePolicyExtImpl.java:299 disconnectAcl(BREDR)）。
-                            flipToLea(bud);
                         }
                     }, sVdspDelay);
                 } catch (Throwable t) {
@@ -337,10 +332,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     }
                     if (tag.contains("le_audio") && sUserOffLea.contains(dev.getAddress())) {
                         return;   // 用户要关，不拦
-                    }
-                    if (!tag.contains("le_audio") && cfgBool("plane_flip", false)) {
-                        // 互斥模式下"禁经典"是我们要的稳态，交给系统自己写
-                        return;
                     }
                     // 不能改成 ALLOWED 再放行：内部 ALLOWED 写入会 connect()，
                     // connect() 又回写 FORBIDDEN —— 死循环。吞掉即可。
@@ -414,8 +405,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                 return;
             }
             repairClassicPolicy(dev, which + " 来向");
-            if (cfgBool("plane_flip", false)
-                    || !cfgBool("le_first", true) || !wantLea(dev)) {
+            if (!cfgBool("le_first", true) || !wantLea(dev)) {
                 return;
             }
             if (which.equals("HFP") && !cfgBool("gate_hfp", true)) {
@@ -503,9 +493,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         log("LE Audio 已连接（deviceConnected）: " + dev);
                         endRound(dev);
                         holdGatt(dev);
-                        if (allLeaUp()) {
-                            sBootTries.remove(dev.getAddress());   // 两只都到位 = 新会话，配额重置
-                        }
                         if (cfgBool("adopt_ctx", true) && sAdoptedMask != 0) {
                             adoptGroupContexts(dev);
                         }
@@ -587,7 +574,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                                 log("LE Audio 断开（native 事件）: " + dev);
                                 endRound((BluetoothDevice) dev);
                                 forgetGatt(((BluetoothDevice) dev).getAddress());
-                                maybeFallBackToBrd(((BluetoothDevice) dev).getAddress(), "native");
                                     }
                         }
                     } catch (Throwable ignored) {
@@ -705,95 +691,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         if (!cfgBool("fix_policy", true) || sCtx == null) {
             return;
         }
-        String addr = dev.getAddress();
-        if (!cfgBool("plane_flip", false) || sUserOffLea.contains(addr)) {
-            // 保底/用户自己关了 LE Audio：经典该是允许的，只做"修被写死的策略"
-            fixOne(dev, PROFILE_A2DP, sUserOffA2dp, "a2dp", why);
-            fixOne(dev, PROFILE_HFP, sUserOffHfp, "hfp", why);
-            return;
-        }
-        if (sPlane.get(addr) != null) {
-            return;                       // 引导面已立过（或已在 LE 面）
-        }
-        Integer done = sBootTries.get(addr);
-        int tried = done == null ? 0 : done.intValue();
-        if (tried >= MAX_BOOTSTRAP) {
-            log(addr + " 引导已试满 " + MAX_BOOTSTRAP + " 次，不再自动翻面（可关 plane_flip 走 AAC）");
-            return;
-        }
-        sBootTries.put(addr, Integer.valueOf(tried + 1));
-        sPlane.put(addr, "brd");
-        setPolicy(dev, PROFILE_LE_AUDIO, POLICY_FORBIDDEN);
-        setPolicy(dev, PROFILE_A2DP, POLICY_ALLOWED);
-        setPolicy(dev, PROFILE_HFP, POLICY_ALLOWED);
-        log("立引导面（第 " + (tried + 1) + " 次）：a2dp/hfp=ALLOWED、le_audio=FORBIDDEN，"
-                + "显式拨经典去拿 HFP SLC（" + why + "）: " + dev);
-        invokeByName(sHsRef, "connect", dev);
-        invokeByName(sA2dpRef, "connect", dev);
-    }
-
-    /** 只写存储，不调 profile 的 setConnectionPolicy —— 后者自带 connect/disconnect 副作用 */
-    private static void setPolicy(BluetoothDevice dev, int profileId, int policy) {
-        invokeByName(sCtx, "setProfileConnectionPolicy", dev,
-                Integer.valueOf(profileId), Integer.valueOf(policy));
-    }
-
-    /**
-     * ColorOS 的时序：HFP SLC 起来 -> 发 +VDSP=1,1 把耳机的音频面翻到 LE Audio
-     * （OplusLeAudioServiceExt.java:328-334 / OplusBluetoothATCommandExtension.java:480-490）
-     * -> 经典让位（OplusPhonePolicyExtImpl.java:299 disconnectAcl(BREDR)）-> 逐成员连 LE。
-     */
-    private static void flipToLea(BluetoothDevice dev) {
-        if (!cfgBool("plane_flip", false) || sCtx == null) {
-            return;
-        }
-        String addr = dev.getAddress();
-        if ("lea".equals(sPlane.get(addr))) {
-            return;
-        }
-        sPlane.put(addr, "lea");
-        setPolicy(dev, PROFILE_LE_AUDIO, POLICY_ALLOWED);
-        setPolicy(dev, PROFILE_A2DP, POLICY_FORBIDDEN);
-        setPolicy(dev, PROFILE_HFP, POLICY_FORBIDDEN);
-        invokeByName(sA2dpRef, "disconnect", dev);
-        invokeByName(sHsRef, "disconnect", dev);
-        log("翻面给 LE Audio：le_audio=ALLOWED、a2dp/hfp=FORBIDDEN，经典 profile 已断: " + dev);
-        connectAllLeaMembers(dev);
-    }
-
-    /** 组内成员逐个连 —— HyperOS 没有 ColorOS 的 pairPeerDeviceIfNeed，得自己拉 */
-    private static void connectAllLeaMembers(BluetoothDevice why) {
-        if (leaSvc() == null) {
-            return;
-        }
-        for (String addr : sBuds) {
-            Object d = invokeByName(sCtx, "getRemoteDevice", addr);
-            if (!(d instanceof BluetoothDevice)) {
-                continue;
-            }
-            BluetoothDevice peer = (BluetoothDevice) d;
-            int st = leaState(peer);
-            if (st == LEA_CONNECTED || st == LEA_CONNECTING) {
-                continue;
-            }
-            log("连 LE Audio 成员: " + peer + "（因 " + why + "）");
-            invokeByName(leaSvc(), "connect", peer);
-        }
-    }
-
-    /** LE 面整个没了 -> 撤掉面标记，下一次来向/全量连接会重新立引导面 */
-    private static void maybeFallBackToBrd(String addr, String why) {
-        if (!"lea".equals(sPlane.get(addr))) {
-            return;
-        }
-        for (String a : sBuds) {
-            Object d = sCtx == null ? null : invokeByName(sCtx, "getRemoteDevice", a);
-            if (d instanceof BluetoothDevice && leaState((BluetoothDevice) d) != LEA_DISCONNECTED) {
-                return;                      // 还有成员在 LE 面上，别撤
-            }
-        }
-        sPlane.remove(addr);
-        log("LE 面没了（" + why + "），退回引导面等下一次连接: " + addr);
+        fixOne(dev, PROFILE_A2DP, sUserOffA2dp, "a2dp", why);
+        fixOne(dev, PROFILE_HFP, sUserOffHfp, "hfp", why);
     }
 
     private static void fixOne(BluetoothDevice dev, int profileId, Set<String> userOff,
@@ -917,17 +816,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         }
         return toInt(invokeByName(leaSvc(), "getConnectionPolicy", dev), POLICY_ALLOWED)
                 != POLICY_FORBIDDEN;
-    }
-
-    private static boolean allLeaUp() {
-        int up = 0;
-        for (String a : sBuds) {
-            Object d = sCtx == null ? null : invokeByName(sCtx, "getRemoteDevice", a);
-            if (d instanceof BluetoothDevice && leaState((BluetoothDevice) d) == LEA_CONNECTED) {
-                up++;
-            }
-        }
-        return up >= 2;
     }
 
     private static int leaState(BluetoothDevice dev) {
