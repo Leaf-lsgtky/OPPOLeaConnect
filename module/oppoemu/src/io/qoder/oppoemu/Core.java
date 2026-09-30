@@ -1,6 +1,8 @@
 package io.qoder.oppoemu;
 
 import android.bluetooth.BluetoothDevice;
+import android.content.Context;
+import android.content.SharedPreferences;
 import de.robv.android.xposed.XC_MethodHook.MethodHookParam;
 import android.os.Bundle;
 import android.os.Handler;
@@ -90,6 +92,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final Set<String> sUserOffA2dp = new HashSet<String>();
     private static final Set<String> sUserOffHfp = new HashSet<String>();
     private static final Set<String> sBuds = new HashSet<String>();
+    /** 有 BR/EDR 链路密钥的那只（经典腿只能拨它）—— 落盘，开关蓝牙后新进程也认得 */
+    private static String sClassicAddr;
     private static final Set<String> sActed = new HashSet<String>();
     /** 本周期已经补拨过经典的地址（onCreate / LE 到手时清空） */
     private static final Set<String> sWoke = new HashSet<String>();
@@ -209,6 +213,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         return;
                     }
                     BluetoothDevice dev = (BluetoothDevice) p.args[1];
+                    // HFP 的 AT 只可能走 BR/EDR：见到 AT 就认它那只地址是经典腿
+                    rememberClassic(dev.getAddress());
                     String reply = buildReply(at);
                     log("AT 收到: " + at + " from " + dev);
                     if (reply == null || sMethodAtString == null || sMethodAtCode == null) {
@@ -459,38 +465,45 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     }
 
     /**
-     * 补拨的统一入口：把纯 LE 地址映射到那只经典设备，然后走一次全量连接
+     * 补拨的统一入口：把事件里的地址换成那只经典设备，然后走一次全量连接
      * （等价于用户在设置里点"连接"）。
      *
      * 只由事件驱动，没有任何定时器/间隔窗口：调用点是
-     *   - LE_AUDIO 这个 ProfileService 报"起好了"（onProfileServiceStateChanged，HyperOS 传 12）；
+     *   - 每个 ProfileService 报"起好了"（onProfileServiceStateChanged，HyperOS 传 12=ON）；
      *   - PhonePolicy.autoConnect() / autoConnectLeAudio(dev)（系统自己发起回连的那一刻）；
      *   - LE Audio 那一次尝试判死（native type=1 v1=0）与 deviceDisconnected；
      *   - 耳机来向连接、用户在设置里主动点连接。
-     * 去重用 sWoke（每个适配器周期一条额度，连上任一 profile 就归还），不用"3 秒内不重复"这种时间窗口。
+     * 失败/断开那几条走 sWoke（每个适配器周期一条额度，连上任一 profile 就归还）；
+     * profile 起好这条不占额度 —— 它靠"经典还没连上"这个状态自己收口，
+     * 不用"3 秒内不重复"这种时间窗口。
      *
-     * 为什么要映射到经典地址：LE 断开事件经常落在纯 LE 的 46:3B 上，而 page 只对主耳那个
-     * 经典地址有用；v6.13 之前这里直接 return，等于那种情况下什么都没拨。
+     * 为什么要换成经典地址：LE 断开事件经常落在纯 LE 的 46:3B 上，而 page 只对主耳那个
+     * 经典地址有用；更关键的是 HyperOS 在 btservice/AdapterService.java:2409-2411 对
+     * LE-only 设备直接 "skip connectAllSupportedProfiles" 返回 —— 拨到纯 LE 那只等于没拨。
      */
-    private static void connectNow(BluetoothDevice dev, String why) {
+    private static void connectNow(BluetoothDevice dev, String why, boolean oncePerCycle) {
         if (!cfgBool("wake_classic", true) || sCtx == null || dev == null) {
             return;
         }
         BluetoothDevice target = dev;
-        try {
-            if (dev.getType() == BluetoothDevice.DEVICE_TYPE_LE) {
-                target = findBondedClassicBud();
-                if (target == null) {
-                    log(why + "：" + dev + " 是纯 LE 地址，且找不到经典那只，放弃补拨");
-                    return;
-                }
-            }
-        } catch (Throwable ignored) {
+        BluetoothDevice classic = findBondedClassicBud();
+        if (classic != null && !classic.getAddress().equals(dev.getAddress())) {
+            target = classic;
+        } else if (classic == null && !isBudNameless(dev)) {
+            log(why + "：认不出经典那只，放弃补拨（事件里的地址是 " + dev + "）");
+            return;
         }
         if (a2dpConnected(target) || hfpConnected(target) || leaState(target) == LEA_CONNECTED) {
             return;
         }
-        if (!sWoke.add(target.getAddress())) {
+        // AdapterService.java:2397-2401：profile 服务没起齐时 connectAllEnabledProfiles
+        // 只打一条 "Not all profile services running" 就 return 1，一个 profile 都不会拨。
+        // 开机那一串 profile-ON 事件会连着来，所以这里直接跳过、等下一个事件，不用延时。
+        if (Boolean.FALSE.equals(invokeByName(sCtx, "profileServicesRunning"))) {
+            log(why + "：profile 服务还没起齐，等下一个 profile-ON 事件再拨");
+            return;
+        }
+        if (oncePerCycle && !sWoke.add(target.getAddress())) {
             return;
         }
         repairClassicPolicy(target, why);
@@ -509,18 +522,23 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             if (!(bonded instanceof java.util.Collection)) {
                 return null;
             }
+            BluetoothDevice guess = null;
             for (Object o : (java.util.Collection) bonded) {
                 if (!(o instanceof BluetoothDevice)) {
                     continue;
                 }
                 BluetoothDevice d = (BluetoothDevice) o;
+                if (sClassicAddr != null && sClassicAddr.equals(d.getAddress())) {
+                    return d;
+                }
                 if (d.getType() == BluetoothDevice.DEVICE_TYPE_LE) {
                     continue;
                 }
-                if (isBudNameless(d)) {
-                    return d;
+                if (guess == null && isBudNameless(d)) {
+                    guess = d;
                 }
             }
+            return guess;
         } catch (Throwable t) {
             log("findBondedClassicBud 异常: " + t);
         }
@@ -559,12 +577,73 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             }
             String n = name.toUpperCase();
             if (n.contains("OPPO") || n.contains("ONEPLUS") || n.contains("ENCO")) {
-                sBuds.add(dev.getAddress());
+                rememberBud(dev.getAddress());
                 return via;
             }
         } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    /**
+     * 耳机地址必须落盘：开关蓝牙走的是每次全新的 com.android.bluetooth 进程，
+     * 而 sBuds 只在内存里。实测 19:26:24 那一轮，开机瞬间 getName/getRemoteName/getAlias
+     * 三个来源全拿不到名字，于是配对列表里一个耳机都认不出来，补拨一次都没发出去；
+     * 同一版 19:18 那一轮名字缓存还热，就连上了 —— 完全看运气。
+     */
+    private static void loadBuds() {
+        if (!(sCtx instanceof Context)) {
+            return;
+        }
+        try {
+            SharedPreferences sp = ((Context) sCtx).getSharedPreferences("oppoemu_buds", Context.MODE_PRIVATE);
+            Set<String> all = sp.getStringSet("all", null);
+            if (all != null) {
+                sBuds.addAll(all);
+            }
+            sClassicAddr = sp.getString("classic", null);
+            log("已加载耳机地址 " + sBuds + "，经典那只=" + sClassicAddr);
+        } catch (Throwable t) {
+            log("loadBuds 异常: " + t);
+        }
+    }
+
+    private static void saveBuds() {
+        if (!(sCtx instanceof Context)) {
+            return;
+        }
+        try {
+            ((Context) sCtx).getSharedPreferences("oppoemu_buds", Context.MODE_PRIVATE)
+                    .edit().putStringSet("all", new HashSet<String>(sBuds))
+                    .putString("classic", sClassicAddr).apply();
+        } catch (Throwable t) {
+            log("saveBuds 异常: " + t);
+        }
+    }
+
+    private static void rememberBud(String addr) {
+        if (addr == null || sBuds.contains(addr)) {
+            return;
+        }
+        sBuds.add(addr);
+        log("记录耳机地址: " + addr);
+        saveBuds();
+    }
+
+    /**
+     * 经典腿只认这一个地址。判据是事件而不是类型：HFP 的 AT 交互只可能发生在 BR/EDR 上
+     * （纯 LE 的 46:3B 走不到 processUnknownAt），所以只要见过它发 AT，它就是经典那只。
+     * BluetoothDevice.getType() 在这个时刻不可信 —— 实测补拨时对 46:3B 也没映射成功，
+     * 说明那时它报的不是 DEVICE_TYPE_LE，于是全量连接拨到了纯 LE 的耳上，
+     * 被 AdapterService.java:2409-2411 的 "skip connectAllSupportedProfiles for LE-only device" 吃掉。
+     */
+    private static void rememberClassic(String addr) {
+        if (addr == null || addr.equals(sClassicAddr)) {
+            return;
+        }
+        sClassicAddr = addr;
+        log("经典腿地址: " + addr);
+        saveBuds();
     }
 
     /** 一轮结束：LE 到手或断开，下一轮重新给 LE 机会 */
@@ -712,7 +791,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         sGameForced = false;
                         // 不在这里重新拦经典：否则 LE 一断就把经典饿死，形成"断开后不回连"
                         log("LE Audio 断开: " + dev + "，下一轮重新给 LE 机会");
-                        connectNow(dev, "LE Audio 断开（deviceDisconnected）");
+                        connectNow(dev, "LE Audio 断开（deviceDisconnected）", true);
                     }
                 }
             });
@@ -773,7 +852,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                                 endRound((BluetoothDevice) dev);
                                 forgetGatt(((BluetoothDevice) dev).getAddress());
                                 sGameForced = false;
-                                connectNow((BluetoothDevice) dev, "LE 那一次尝试失败");
+                                connectNow((BluetoothDevice) dev, "LE 那一次尝试失败", true);
                                     }
                         }
                     } catch (Throwable ignored) {
@@ -847,24 +926,24 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             de.robv.android.xposed.XposedBridge.hookMethod(ps, new Hook() {
                 @Override
                 protected void after(MethodHookParam p) {
-                    if (toInt(invokeByName(p.args[0], "getProfileId"), -1) != 22
-                            || !(p.args[1] instanceof Integer)) {
+                    // AdapterService.java:4125-4133 只是把消息丢给 mHandler，
+                    // mRunningProfiles 要等 mHandler 处理（:352）才加上这一个 profile。
+                    // 所以这里 post 一次：排在同一条主线程队列的后面，等它把这一个记完账再看状态。
+                    // 不判 profileId —— 开机那一串 ON 事件里谁都不知道哪个是最后一个，
+                    // 每个都试一次，profileServicesRunning() 之前的一律空转，第一个通过的就赢。
+                    if (!(p.args[1] instanceof Integer) || ((Integer) p.args[1]).intValue() != 12) {
                         return;
                     }
-                    // 这里传的是 12=Starting、10=Stopping（AdapterService.java:6658-6672），
-                    // 不是 AOSP 的 STARTED=2 —— 写死 2 这个钩子永远不动
-                    if (((Integer) p.args[1]).intValue() != 12) {
-                        return;
-                    }
-                    Object bonded = invokeByName(sCtx, "getBondedDevices");
-                    if (!(bonded instanceof java.util.Collection)) {
-                        return;
-                    }
-                    for (Object o : (java.util.Collection) bonded) {
-                        if (o instanceof BluetoothDevice && isBudNameless((BluetoothDevice) o)) {
-                            connectNow((BluetoothDevice) o, "LE Audio profile 起好");
+                    final String why = "profile " + invokeByName(p.args[0], "getProfileId") + " 起好";
+                    MAIN.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            BluetoothDevice classic = findBondedClassicBud();
+                            if (classic != null) {
+                                connectNow(classic, why, false);
+                            }
                         }
-                    }
+                    });
                 }
             });
             log("hook ok: AdapterService.onProfileServiceStateChanged");
@@ -887,14 +966,9 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     if (withArg) {
                         return;
                     }
-                    Object bonded = invokeByName(sCtx, "getBondedDevices");
-                    if (!(bonded instanceof java.util.Collection)) {
-                        return;
-                    }
-                    for (Object o : (java.util.Collection) bonded) {
-                        if (o instanceof BluetoothDevice && isBudNameless((BluetoothDevice) o)) {
-                            connectNow((BluetoothDevice) o, tag);
-                        }
+                    BluetoothDevice classic = findBondedClassicBud();
+                    if (classic != null) {
+                        connectNow(classic, tag, true);
                     }
                 }
 
@@ -906,7 +980,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     for (int i = p.args.length - 1; i >= 0; i--) {
                         if (p.args[i] instanceof BluetoothDevice
                                 && isBudNameless((BluetoothDevice) p.args[i])) {
-                            connectNow((BluetoothDevice) p.args[i], tag);
+                            connectNow((BluetoothDevice) p.args[i], tag, true);
                             return;
                         }
                     }
@@ -937,6 +1011,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     sLeaRef = unwrapOptional(invokeByName(as, "getLeAudioService"));
                     refreshConfig();
                     sWoke.clear();
+                    loadBuds();
                     log("AdapterService 就绪：" + configLine());
                     // 提前给已配对的耳机注册 interop：闲置定时器是在 LE 链路建好后 4 秒内装的，
                     // 等到第一次事件再认就晚了

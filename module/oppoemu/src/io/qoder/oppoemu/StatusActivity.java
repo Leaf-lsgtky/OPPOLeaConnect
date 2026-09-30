@@ -71,18 +71,25 @@ public class StatusActivity extends Activity {
                         + "做法是对每个 LE 地址做一次 direct connectGatt(TRANSPORT_LE) 且不 close。"
                         + "必须 direct —— opportunistic 不进 hold-link 表（BatteryService 就是这么漏掉的）。"
                         + "代价：这条 LE 链路进不了深睡，耗电略增。");
-        addSwitch(root, "wake_classic", "LE 尝试失败后补一次全量连接（修\"只能回盒\"）",
+        addSwitch(root, "wake_classic", "开关蓝牙后补拨经典（事件驱动，修\"只能回盒\"）",
                 "开关蓝牙/重启蓝牙进程之后永远连不上、必须放回盒子再打开才行。实测：进程起来后手机"
-                        + "只拨 LE Audio，30 秒 LeAudioStateMachine.CONNECT_TIMEOUT 超时（11:55:44 起、"
-                        + "11:56:14 两只耳各一条 type=1 v1=0），**之后没有任何人再去拨经典**；"
-                        + "把本模块 15 个开关全关掉做对照，dumpsys 里一个 A2DP/Headset 状态机都不出现，"
-                        + "所以不是本模块的回归，是 HyperOS 自己不发这一下。而你在设置里点\"连接\""
-                        + "（uid 1000 -> AdapterService.connectAllEnabledProfiles）能连上，"
-                        + "但必须等那次 LE 尝试失败之后再点才行 —— 说明耳机 page scan 开着、是可达的，"
-                        + "缺的就是这一下 BR/EDR 拨号。这里在同一个失败事件上补掉它。"
-                        + "每个\"适配器启动 / 链路曾建立\"的周期只拨一次（sWoke 在 onCreate 和 "
-                        + "deviceConnected 时清空）：当年\"耳机合盖后还在不停尝试连接\"就是定时重拨造成的，"
-                        + "这次不留同一个毛病。");
+                        + "只拨 LE Audio，30 秒 LeAudioStateMachine.CONNECT_TIMEOUT 超时之后没有任何人"
+                        + "再去拨经典（把本模块开关全关做对照，dumpsys 里一个 A2DP/Headset 状态机都不"
+                        + "出现，不是本模块的回归）。你在设置里点\"连接\"（AdapterService"
+                        + ".connectAllEnabledProfiles）能连上，缺的就是这一下 BR/EDR 拨号。"
+                        + "触发点全是事件：每一个 ProfileService 报到 12=ON（AdapterService.java:4125"
+                        + "-4133 只是丢消息给 mHandler，mRunningProfiles 要等 :352 才记账，所以这里"
+                        + " post 排在它后面），以及 PhonePolicy.autoConnect/autoConnectLeAudio、"
+                        + "LE 尝试判死、deviceDisconnected。"
+                        + "两处坑是实测钉死的：一、connectAllEnabledProfiles 在 profileServicesRunning"
+                        + "() 为假时只打一条 \"Not all profile services running\" 就 return（:2397-2401"
+                        + "），一个 profile 都不拨，所以要等 profile 起齐；二、拨到纯 LE 的那只耳会被"
+                        + " :2409-2411 的 \"skip connectAllSupportedProfiles for LE-only device\" 整个吃掉"
+                        + "，所以只拨有 BR/EDR 链路密钥的那只（地址认 HFP 的 AT 交互，落盘在"
+                        + " oppoemu_buds：开关蓝牙每次都是全新的 com.android.bluetooth 进程，纯内存的"
+                        + "地址表开机瞬间认不出耳机就一次都不会拨，19:26 那轮就是这么漏的）。"
+                        + "判死/断开那两条每周期只拨一次（sWoke 在 onCreate 和 deviceConnected 清空）："
+                        + "当年\"耳机合盖后还在不停尝试连接\"就是定时重拨造成的，这次不留同一个毛病。");
         addSwitch(root, "game_ctx", "把手机状态置成\"游戏在场\"（拿低延迟 CC）",
                 "LE Audio 的低延迟档只有手机认为前台是游戏时才拿得到：全进程唯一入口是 "
                         + "LeAudioService.processGameImportanceChange() -> mNativeInterface.setInGame(true)，"
