@@ -8,7 +8,10 @@ plugins {
 
 android {
     namespace = "com.github.leaf.leaconnect"
+    // Google 只发布 android-37.0 这种小版本目录，没有裸的 android-37；
+    // CI 上 sdkmanager 能装到的就是 37.0，这里必须一起声明 minor 才找得到平台。
     compileSdk = 37
+    compileSdkMinor = 0
 
     defaultConfig {
         applicationId = "com.github.leaf.leaconnect"
@@ -20,8 +23,15 @@ android {
 
     buildTypes {
         release {
-            // Core.java 全靠反射摸框架成员，任何裁剪/改名都会把 hook 静默打死，所以不混淆。
-            isMinifyEnabled = false
+            // R8 是开着的，但入口类和 provider 必须按名字 keep：LSPosed 用
+            // Class.forName(java_init.list 里的名字) 加载 Core，改名就等于模块不加载；
+            // Core 反射摸的全是框架成员，框架类不在本 APK 内，不受裁剪影响。
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 

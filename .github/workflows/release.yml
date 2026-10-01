@@ -26,7 +26,7 @@ jobs:
         run: |
           SDKM="$(ls -d "$ANDROID_HOME/cmdline-tools/"*/bin/sdkmanager | sort -V | tail -1)"
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
-          "$SDKM" "platforms;android-37" "build-tools;37.0.0"
+          "$SDKM" "platforms;android-37.0" "build-tools;37.0.0"
 
       - name: Decode keystore
         run: printf '%s' "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
