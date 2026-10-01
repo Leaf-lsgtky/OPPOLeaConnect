@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-37" "build-tools;37.0.0"
+
+      - name: Decode keystore
+        run: printf '%s' "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      # 签名材料只存在于 Actions secrets 里，仓库内没有任何密钥
+      - name: Write keystore.properties
+        run: |
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
+            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+          } > keystore.properties
+
+      - name: Build module APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:moduleApk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPPOLeaConnect-apk
+          path: app/build/outputs/apk/module/*.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/module/*.apk
+          generate_release_notes: true

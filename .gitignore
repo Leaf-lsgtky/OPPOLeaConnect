@@ -23,3 +23,14 @@ local.properties
 .DS_Store
 *.bak
 OPPOLeaConnect/
+
+# gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# 签名材料不入库
+keystore.properties
+*.jks
+*.keystore

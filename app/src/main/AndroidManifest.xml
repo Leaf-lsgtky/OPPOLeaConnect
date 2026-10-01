@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:description="@string/desc"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.LeaConnect">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 开关存储 + 蓝牙进程心跳的落点：普通应用写不了 persist.*，被 hook 的
+             com.android.bluetooth 通过 call() 读，UI 靠它判断模块到底加载没加载 -->
+        <provider
+            android:name="com.github.leaf.leaconnect.ConfigProvider"
+            android:authorities="com.github.leaf.leaconnect.config"
+            android:exported="true" />
+
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposeddescription" android:value="@string/desc" />
+        <meta-data android:name="xposedscope" android:resource="@array/scope" />
+    </application>
+
+</manifest>

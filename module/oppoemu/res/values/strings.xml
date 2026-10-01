@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">OppoEmu</string>
-    <string name="desc">模拟 ColorOS 的 HFP 厂商 AT 应答与 LE Audio 抢占行为，用于在非 OPPO 手机上使用 OPPO/OnePlus 耳机</string>
-</resources>
