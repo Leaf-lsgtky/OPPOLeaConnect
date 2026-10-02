@@ -17,8 +17,8 @@ android {
         applicationId = "com.github.leaf.leaconnect"
         minSdk = 26
         targetSdk = 34
-        versionCode = 79
-        versionName = "7.0"
+        versionCode = 80
+        versionName = "7.1"
     }
 
     buildTypes {
@@ -55,6 +55,7 @@ dependencies {
     // Xposed API 只能是编译期依赖：桩类一旦进 classes.dex，LSPosed 会直接
     // 拒绝加载模块（日志："The Xposed API classes are compiled into the module's APK"）。
     compileOnly(project(":xposed-stubs"))
+    testImplementation("junit:junit:4.13.2")
 
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))

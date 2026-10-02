@@ -11,10 +11,12 @@ import android.os.Looper;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 让非 OPPO 手机用 OPPO/OnePlus 耳机的 LE Audio(LC3)。
@@ -44,6 +46,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final String CL_A2DP = "com.android.bluetooth.a2dp.A2dpService";
     private static final String CL_HS = "com.android.bluetooth.hfp.HeadsetService";
     private static final String CL_LEA = "com.android.bluetooth.le_audio.LeAudioService";
+    private static final String CL_LEA_NI = "com.android.bluetooth.le_audio.LeAudioNativeInterface";
+    private static final String CL_REMOTE = "com.android.bluetooth.btservice.RemoteDevices";
     private static final String CFG_URI = "content://com.github.leaf.leaconnect.config";
 
     private static final int POLICY_FORBIDDEN = 0;
@@ -62,6 +66,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
 
     private static Handler MAIN;
     private static Object sCtx;
+    private static PeerOwnership sPeers;
 
     // 生效开关（provider 优先，其次 persist.oppoemu.*，最后默认值）
     private static boolean sAt = true;
@@ -94,17 +99,18 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final Set<String> sUserOffHfp = new HashSet<String>();
     private static final Set<String> sBuds = new HashSet<String>();
     /** 用户在本进程里主动断开过的耳机（按组记地址）：不再补拨、不占链路、不放行来向 */
-    private static final Set<String> sUserDisc = new HashSet<String>();
+    private static final Set<String> sUserDisc = ConcurrentHashMap.newKeySet();
     /** 有 BR/EDR 链路密钥的那只（经典腿只能拨它）—— 落盘，开关蓝牙后新进程也认得 */
     private static String sClassicAddr;
     private static final Set<String> sActed = new HashSet<String>();
-    /** 本周期已经补拨过经典的地址（onCreate / LE 到手时清空） */
-    private static final Set<String> sWoke = new HashSet<String>();
+    private static final HandoffState sHandoff = new HandoffState();
+    private static final ThreadLocal<Boolean> sModuleCall = new ThreadLocal<Boolean>();
+    private static final Set<String> sLeAclConnected = ConcurrentHashMap.newKeySet();
+    private static final Set<String> sDiscoveryRetried = ConcurrentHashMap.newKeySet();
     /** cfgContext() 的缓存；Boolean.FALSE 表示"拿不到"，别再反复试 */
     private static Object sAppCtx;
-    /** 当前音频面：addr -> "brd"（引导，经典允许） / "lea"（LE Audio 独占） */
-    /** 地址 -> 我们挂上去的 BluetoothGatt（只为占住 hold-link，永不 close） */
-    private static final Map<String, Object> sHeld = new HashMap<String, Object>();
+    /** 只持有已连接的 LE Audio 链路；断开或整组让位时关闭。 */
+    private static final Map<String, Object> sHeld = new ConcurrentHashMap<String, Object>();
 
     @Override
     public void handleLoadPackage(final de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam lpp) {
@@ -126,6 +132,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         hookPolicyRepair(lpp.classLoader);
         hookClassicGate(lpp.classLoader);
         hookLeaEvents(lpp.classLoader);
+        hookHandoff(lpp.classLoader);
         hookReconnectEvents(lpp.classLoader);
         hookAdapterReady(lpp.classLoader);
     }
@@ -272,22 +279,26 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             @Override
             protected void after(MethodHookParam p) {
                 try {
-                    if (!cfgBool("vdsp", true)) {
-                        return;
-                    }
                     final Object sm = outerOf(p.thisObject);
-                    if (sm == null || sMethodAtString == null) {
+                    if (sm == null) {
                         return;
                     }
-                    final Object ni = sFieldNative.get(sm);
                     final Object raw = sFieldDevice.get(sm);
-                    if (ni == null || !(raw instanceof BluetoothDevice)) {
+                    if (!(raw instanceof BluetoothDevice)) {
                         return;
                     }
                     final BluetoothDevice bud = (BluetoothDevice) raw;
+                    if (!cfgBool("vdsp", true) || sMethodAtString == null) {
+                        return;
+                    }
+                    final Object ni = sFieldNative.get(sm);
+                    if (ni == null) {
+                        return;
+                    }
                     MAIN.postDelayed(new Runnable() {
                         @Override
                         public void run() {
+                            if (isPaused(bud)) return;
                             try {
                                 sMethodAtString.invoke(ni, bud, "+VDSP=1,1");
                                 log("已下发 +VDSP=1,1（HFP SLC 之后）");
@@ -338,13 +349,13 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     // CSIP 门（HeadsetService.java:1032-1038 / A2dpService.java:1260-1266）的回写
                     // 也会被算成 uid=1000。真判据是栈：栈里有 profile 自己的 connect() 或 PhonePolicy
                     // 就是系统自动回写，只有纯 binder 入口才是用户在设置里点的。
-                    boolean userAction = !BT_UID.equals(String.valueOf(uid))
-                            && !who.contains("Service.connect:") && !who.contains("PhonePolicy");
+                    boolean userAction = isExplicitRequest();
                     if (userAction) {
                         // 外部（设置界面点击）= 用户意图，放行并记住，别再自作主张改回去
                         remember(sUserOffLea, tag.contains("le_audio"), policy, "LE Audio", dev, uid);
                         remember(sUserOffA2dp, tag.contains(".a2dp."), policy, "媒体音频(a2dp)", dev, uid);
                         remember(sUserOffHfp, tag.contains(".hfp."), policy, "通话音频(hfp)", dev, uid);
+                        if (policy == POLICY_ALLOWED) resumeGroup(dev, "用户打开音频配置");
                         return;
                     }
                     if (policy != POLICY_FORBIDDEN) {
@@ -417,11 +428,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
      */
     private void gate(MethodHookParam p, String which, Object arg0) {
         try {
-            // 第二个参数是 isOutgoingRequest：绝不拦自己人主动发起的连接。
-            // 拦了就等于把补拨/用户在设置里点的那下连接吃掉（早拨"没收益"就是这么来的）
-            if (p.args.length > 1 && Boolean.TRUE.equals(p.args[1])) {
-                return;
-            }
             if (!(arg0 instanceof BluetoothDevice)) {
                 return;
             }
@@ -433,6 +439,12 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                 refuse(p, dev, which, "用户在设置里主动断开过");
                 return;
             }
+            if (isYielded(dev)) {
+                refuse(p, dev, which, "整组已让位，等待用户重新连接");
+                return;
+            }
+            // 用户连接入口先恢复整组权限；让位后晚到的系统去向请求同样必须拒绝。
+            if (p.args.length > 1 && Boolean.TRUE.equals(p.args[1])) return;
             repairClassicPolicy(dev, which + " 来向");
             if (!cfgBool("le_first", true) || !wantLea(dev)) {
                 return;
@@ -484,8 +496,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
      * 只由事件驱动，没有任何定时器/间隔窗口：调用点只有两处，都在"手机自己刚启动"那一侧 ——
      *   - 每个 ProfileService 报到 12=ON（onProfileServiceStateChanged）；
      *   - PhonePolicy.autoConnect() / autoConnectLeAudio(dev)（系统自己发起回连的那一刻）。
-     * 两边都不占 sWoke 额度：profile 那条靠"经典还没连上 + profile 服务已起齐"两个状态自己收口，
-     * PhonePolicy 那条每周期一次（sWoke 在 onCreate 和 deviceConnected 时清）。
+     * 每个蓝牙启动周期最多补拨一次；整组让位后不再补拨。尝试额度与连接成功状态分别记录。
      * 判死/断开那两类事件以前也挂在这里，v6.18 删了：合盖后它们会连着几次把经典往关死的盒子里 page。
      *
      * 为什么要换成经典地址：LE 断开事件经常落在纯 LE 的 46:3B 上，而 page 只对主耳那个
@@ -507,8 +518,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         if (a2dpConnected(target) || hfpConnected(target) || leaState(target) == LEA_CONNECTED) {
             return;
         }
-        if (isUserDisc(target) || isUserDisc(dev)) {
-            log(why + "：用户在设置里主动断开过，不补拨");
+        if (isUserDisc(target) || isUserDisc(dev) || isYielded(target) || isYielded(dev)) {
+            log(why + "：整组已暂停，不补拨");
             return;
         }
         // AdapterService.java:2397-2401：profile 服务没起齐时 connectAllEnabledProfiles
@@ -518,13 +529,20 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             log(why + "：profile 服务还没起齐，等下一个 profile-ON 事件再拨");
             return;
         }
-        if (oncePerCycle && !sWoke.add(target.getAddress())) {
+        if (oncePerCycle && !sHandoff.takeStartupAttempt(target.getAddress())) {
             return;
         }
         repairClassicPolicy(target, why);
         log(why + "：补一次全量连接（等价于设置里点连接）: " + target
                 + (target == dev ? "" : "（由 " + dev + " 映射）"));
-        invokeByName(sCtx, "connectAllEnabledProfiles", target);
+        Boolean previous = sModuleCall.get();
+        sModuleCall.set(Boolean.TRUE);
+        try {
+            invokeByName(sCtx, "connectAllEnabledProfiles", target);
+        } finally {
+            sModuleCall.set(previous);
+        }
+        if (sPeers != null) sPeers.request(target.getAddress(), false);
     }
 
     /** 纯 LE 的那只耳没有经典链路，补拨要落到主耳那个经典地址上 */
@@ -704,6 +722,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                 log("组 " + gid + " 里拿不到 lead，跳过 setActiveDevice");
                 return;
             }
+            if (isPaused((BluetoothDevice) lead)) return;
             log("setActiveDevice(组的 lead/主耳): " + lead);
             invokeByName(leaSvc(), "setActiveDevice", lead);
         } catch (Throwable t) {
@@ -772,9 +791,15 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         BluetoothDevice dev = (BluetoothDevice) p.args[0];
                         log("LE Audio 已连接（deviceConnected）: " + dev);
                         endRound(dev);
-                        // LE 到手了，这个地址的补拨额度重置（下次真断开还可以再拨一次）
-                        sWoke.remove(dev.getAddress());
+                        groupDevices(dev);
+                        sHandoff.connected(dev.getAddress());
+                        if (isYielded(dev) || isUserDisc(dev)) {
+                            stopGroup(dev, "让位后收到延迟连接事件");
+                            return;
+                        }
                         holdGatt(dev);
+                        if (sPeers != null) sPeers.request(dev.getAddress(), false);
+                        completeGroup(dev);
                         // 必须赶在流起来之前：CC/QoS 是在 codec configure 时按场景表挑的，
                         // 等组 ACTIVE（type=2）再置就晚了一整轮
                         applyGameCtx("LE Audio 连接");
@@ -831,11 +856,28 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                 return;
             }
             de.robv.android.xposed.XposedBridge.hookMethod(m, new Hook() {
+                @Override protected void before(MethodHookParam p) {
+                    Object e = p.args[0];
+                    Object raw = objVal(e, "device");
+                    if (intVal(e, "type") == 1 && intVal(e, "valueInt1") == LEA_CONNECTED
+                            && raw instanceof BluetoothDevice && isBud((BluetoothDevice) raw)) {
+                        BluetoothDevice dev = (BluetoothDevice) raw;
+                        groupDevices(dev);
+                        sHandoff.connected(dev.getAddress());
+                    }
+                }
+
                 @Override
                 protected void after(MethodHookParam p) {
                     try {
                         Object e = p.args[0];
                         int type = intVal(e, "type");
+                        Object raw = objVal(e, "device");
+                        if (type == 1 && intVal(e, "valueInt1") == LEA_CONNECTED
+                                && raw instanceof BluetoothDevice && isPaused((BluetoothDevice) raw)) {
+                            stopGroup((BluetoothDevice) raw, "让位后 native 意外重新连接");
+                            return;
+                        }
                         if (type != 1 && type != 2 && type != 4 && type != 13) {
                             return;
                         }
@@ -869,7 +911,13 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                             if (dev instanceof BluetoothDevice && isBud((BluetoothDevice) dev)) {
                                 log("LE Audio 断开（native 事件）: " + dev);
                                 endRound((BluetoothDevice) dev);
-                                forgetGatt(((BluetoothDevice) dev).getAddress());
+                                String address = ((BluetoothDevice) dev).getAddress();
+                                if (!sLeAclConnected.contains(address)) releaseHeld(address);
+                                else retryServiceDiscovery((BluetoothDevice) dev);
+                                final BluetoothDevice failed = (BluetoothDevice) dev;
+                                MAIN.post(new Runnable() {
+                                    @Override public void run() { completeGroup(failed); }
+                                });
                                 sGameForced = false;
                             }
                         }
@@ -958,7 +1006,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         public void run() {
                             BluetoothDevice classic = findBondedClassicBud();
                             if (classic != null) {
-                                connectNow(classic, why, false);
+                                if (sPeers != null) sPeers.start();
+                                connectNow(classic, why, true);
                             }
                         }
                     });
@@ -973,7 +1022,7 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         hookPolicy(cl, "autoConnectLeAudio", BluetoothDevice.class, "PhonePolicy.autoConnectLeAudio", true);
     }
 
-    /** PhonePolicy 的两个回连入口：after=系统自己那轮跑完再补，before=和它同时补 */
+    /** 保留正常双耳补连；只有确认整组让位后才阻止系统回连。 */
     private void hookPolicy(ClassLoader cl, String name, Class<?> argType, String tag, final boolean withArg) {
         try {
             Class<?> pp = Class.forName("com.android.bluetooth.btservice.PhonePolicy", false, cl);
@@ -996,9 +1045,17 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                         return;
                     }
                     for (int i = p.args.length - 1; i >= 0; i--) {
-                        if (p.args[i] instanceof BluetoothDevice
-                                && isBudNameless((BluetoothDevice) p.args[i])) {
-                            connectNow((BluetoothDevice) p.args[i], tag, true);
+                        if (p.args[i] instanceof BluetoothDevice) {
+                            BluetoothDevice dev = (BluetoothDevice) p.args[i];
+                            if (!isBudNameless(dev)) {
+                                continue;
+                            }
+                            if (isYielded(dev) || isUserDisc(dev)) {
+                                p.setResult(null);
+                                log(tag + "：整组已暂停，跳过系统自动回连: " + dev);
+                                return;
+                            }
+                            connectNow(dev, tag, true);
                             return;
                         }
                     }
@@ -1008,6 +1065,202 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("hook 跳过: " + tag + " —— " + t);
         }
+    }
+
+    private void hookHandoff(ClassLoader cl) {
+        Method acl = findMethod(cl, CL_REMOTE, "aclStateChangeCallback", int.class, byte[].class,
+                int.class, int.class, int.class, int.class, int.class);
+        if (acl != null) {
+            de.robv.android.xposed.XposedBridge.hookMethod(acl, new Hook() {
+                @Override protected void before(MethodHookParam p) {
+                    int transport = toInt(p.args[3], -1);
+                    if (toInt(p.args[0], -1) != 0 || (transport != 1 && transport != 2)) return;
+                    Object raw = invokeByName(p.thisObject, "getDevice", p.args[1]);
+                    if (!(raw instanceof BluetoothDevice) || !isBud((BluetoothDevice) raw)) return;
+                    final BluetoothDevice dev = (BluetoothDevice) raw;
+                    groupDevices(dev);
+                    int state = toInt(p.args[4], -1);
+                    if (state == 0 && transport == 2) {
+                        sLeAclConnected.add(dev.getAddress());
+                        MAIN.post(new Runnable() {
+                            @Override public void run() {
+                                if (isPaused(dev)) stopGroup(dev, "让位后 LE ACL 意外重新建立");
+                                else holdGatt(dev);
+                            }
+                        });
+                        return;
+                    }
+                    if (state == 1 && transport == 2) {
+                        sLeAclConnected.remove(dev.getAddress());
+                        releaseHeld(dev.getAddress());
+                    }
+                    if (sHandoff.remoteDisconnect(dev.getAddress(), transport, state, toInt(p.args[5], -1))) {
+                        log("ACL 被远端主动终止(HCI 0x13, transport=" + transport + ")，整组让位: "
+                                + sHandoff.membersOf(dev.getAddress()));
+                        stopGroup(dev, "远端主动断开");
+                    }
+                }
+            });
+            log("hook ok: RemoteDevices.aclStateChangeCallback 整组让位");
+        } else {
+            log("hook 跳过: RemoteDevices.aclStateChangeCallback，无法识别远端接管");
+        }
+
+        guardLeConnection(cl, CL_LEA, "connect", true);
+        guardLeConnection(cl, CL_LEA, "okToConnect", false);
+        guardLeConnection(cl, CL_LEA_NI, "connectLeAudio", false);
+        Method enable = findMethod(cl, CL_LEA_NI, "setEnableState", BluetoothDevice.class, boolean.class);
+        if (enable != null) {
+            de.robv.android.xposed.XposedBridge.hookMethod(enable, new Hook() {
+                @Override protected void before(MethodHookParam p) {
+                    if (Boolean.TRUE.equals(p.args[1]) && p.args[0] instanceof BluetoothDevice
+                            && isPaused((BluetoothDevice) p.args[0])) {
+                        p.setResult(Boolean.FALSE);
+                        log("拦 native 重新启用，整组已暂停: " + p.args[0]);
+                    }
+                }
+            });
+            log("hook ok: LeAudioNativeInterface.setEnableState 保护让位状态");
+        }
+    }
+
+    private void guardLeConnection(ClassLoader cl, String className, String name, final boolean userEntry) {
+        Method method = findMethod(cl, className, name, BluetoothDevice.class);
+        if (method == null) {
+            log("hook 跳过: " + shortName(className) + "." + name);
+            return;
+        }
+        de.robv.android.xposed.XposedBridge.hookMethod(method, new Hook() {
+            @Override protected void before(MethodHookParam p) {
+                if (!(p.args[0] instanceof BluetoothDevice)) return;
+                BluetoothDevice dev = (BluetoothDevice) p.args[0];
+                if (!isBud(dev)) return;
+                if (userEntry && isExplicitRequest()) resumeGroup(dev, "用户主动连接 LE Audio");
+                if (isPaused(dev)) {
+                    p.setResult(Boolean.FALSE);
+                    log("拦 " + name + "，整组已暂停: " + dev);
+                }
+            }
+        });
+        log("hook ok: " + shortName(className) + "." + name + " 保护让位状态");
+    }
+
+    private static boolean isExplicitRequest() {
+        if (Boolean.TRUE.equals(sModuleCall.get())
+                || BT_UID.equals(String.valueOf(android.os.Binder.getCallingUid()))) return false;
+        String caller = whoCalled();
+        return !caller.contains("PhonePolicy") && !caller.contains("Service.connect:");
+    }
+
+    private static ArrayList<BluetoothDevice> groupDevices(BluetoothDevice dev) {
+        Map<String, BluetoothDevice> members = new HashMap<String, BluetoothDevice>();
+        members.put(dev.getAddress(), dev);
+        Object lea = leaSvc();
+        int groupId = toInt(invokeByName(lea, "getGroupId", dev), -1);
+        Object group = groupId < 0 ? null : invokeByName(lea, "getGroupDevices", Integer.valueOf(groupId));
+        if (group instanceof Collection) {
+            for (Object raw : (Collection<?>) group) {
+                if (raw instanceof BluetoothDevice) {
+                    BluetoothDevice member = (BluetoothDevice) raw;
+                    members.put(member.getAddress(), member);
+                    rememberBud(member.getAddress());
+                }
+            }
+        }
+        Object classic = invokeByName(sCtx, "findBrDevice", dev.getAddress());
+        if (classic instanceof BluetoothDevice) {
+            BluetoothDevice br = (BluetoothDevice) classic;
+            members.put(br.getAddress(), br);
+        }
+        sHandoff.registerGroup(members.keySet());
+        for (String address : sHandoff.membersOf(dev.getAddress())) {
+            if (members.containsKey(address)) continue;
+            Object raw = invokeByName(sCtx, "getRemoteDevice", address);
+            if (raw instanceof BluetoothDevice) members.put(address, (BluetoothDevice) raw);
+        }
+        return new ArrayList<BluetoothDevice>(members.values());
+    }
+
+    private static boolean isYielded(BluetoothDevice dev) {
+        return dev != null && sHandoff.isYielded(dev.getAddress());
+    }
+
+    private static boolean isPaused(BluetoothDevice dev) {
+        return isYielded(dev) || isUserDisc(dev);
+    }
+
+    private static void retryServiceDiscovery(final BluetoothDevice dev) {
+        final String address = dev.getAddress();
+        if (isPaused(dev) || sHandoff.hasEstablished(address) || !sHeld.containsKey(address)
+                || !sDiscoveryRetried.add(address)) return;
+        MAIN.post(new Runnable() {
+            @Override public void run() {
+                if (isPaused(dev) || !sLeAclConnected.contains(address) || leaState(dev) == LEA_CONNECTED) return;
+                Object gatt = sHeld.get(address);
+                Object refreshed = invokeByName(gatt, "refresh");
+                log("LE Audio 服务发现失败但 ACL 仍在线，刷新 GATT 缓存一次: " + dev + " refreshed=" + refreshed);
+                if (Boolean.TRUE.equals(refreshed)) invokeByName(leaSvc(), "connect", dev);
+            }
+        });
+    }
+
+    private static void completeGroup(BluetoothDevice dev) {
+        if (isPaused(dev)) return;
+        ArrayList<BluetoothDevice> members = groupDevices(dev);
+        boolean connectedPeer = false;
+        for (BluetoothDevice member : members) connectedPeer |= leaState(member) == LEA_CONNECTED;
+        if (!connectedPeer) return;
+        for (BluetoothDevice member : members) {
+            int state = leaState(member);
+            if (isPaused(member) || !wantLea(member) || state == LEA_CONNECTED || state == LEA_DISCONNECTING) continue;
+            if (sHandoff.takeCompletionAttempt(member.getAddress())) {
+                // Connecting 状态机吞掉重复 CONNECT；直接升级 native 的后台连接请求。
+                Object result = state == LEA_CONNECTING
+                        ? invokeByName(objVal(leaSvc(), "mNativeInterface"), "connectLeAudio", member)
+                        : invokeByName(leaSvc(), "connect", member);
+                log("补齐 LE Audio 组，直接连接缺失成员一次: " + member + " result=" + result);
+            }
+        }
+    }
+
+    private static void stopGroup(final BluetoothDevice dev, final String why) {
+        final ArrayList<BluetoothDevice> members = groupDevices(dev);
+        if (sPeers != null) sPeers.withdraw(dev.getAddress());
+        MAIN.post(new Runnable() {
+            @Override public void run() {
+                if (!isPaused(dev)) return;
+                Object lea = leaSvc();
+                Object ni = objVal(lea, "mNativeInterface");
+                for (BluetoothDevice member : members) {
+                    Object disabled = invokeByName(ni, "setEnableState", member, Boolean.FALSE);
+                    // Disconnected 状态也要调用 native，取消 CONNECTING_AUTOCONNECT 的挂起请求。
+                    invokeByName(ni, "disconnectLeAudio", member);
+                    invokeByName(lea, "disconnect", member);
+                    releaseHeld(member.getAddress());
+                    sActed.remove(member.getAddress());
+                    endRound(member);
+                    invokeByName(sCtx, "disconnectAllEnabledProfiles", member, Integer.valueOf(0));
+                    log(why + "：停止整组成员 native 回连并释放链路: " + member
+                            + " disabled=" + disabled);
+                }
+            }
+        });
+    }
+
+    private static void resumeGroup(BluetoothDevice dev, String why) {
+        ArrayList<BluetoothDevice> members = groupDevices(dev);
+        if (sPeers != null) sPeers.request(dev.getAddress(), true);
+        boolean changed = sHandoff.resume(dev.getAddress());
+        for (BluetoothDevice member : members) {
+            changed |= sUserDisc.remove(member.getAddress());
+            if (leaState(member) == LEA_CONNECTED) sHandoff.connected(member.getAddress());
+        }
+        if (!changed) return;
+        Object ni = objVal(leaSvc(), "mNativeInterface");
+        for (BluetoothDevice member : members) {
+            if (wantLea(member)) invokeByName(ni, "setEnableState", member, Boolean.TRUE);
+        }
+        log(why + "：恢复整组连接权限: " + sHandoff.membersOf(dev.getAddress()));
     }
 
     // ------------------------------------------------------ AdapterService 起点
@@ -1027,21 +1280,29 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                     sA2dpRef = unwrapOptional(invokeByName(as, "getA2dpService"));
                     sHsRef = unwrapOptional(invokeByName(as, "getHeadsetService"));
                     sLeaRef = unwrapOptional(invokeByName(as, "getLeAudioService"));
+                    invalidateConfig();
                     refreshConfig();
-                    sWoke.clear();
+                    sHandoff.reset();
+                    sLeAclConnected.clear();
+                    sDiscoveryRetried.clear();
                     clearUserDisc("蓝牙进程重启");
                     loadBuds();
-                    log("AdapterService 就绪：" + configLine());
-                    // 提前给已配对的耳机注册 interop：闲置定时器是在 LE 链路建好后 4 秒内装的，
-                    // 等到第一次事件再认就晚了
-                    Object bonded = invokeByName(as, "getBondedDevices");
-                    if (bonded instanceof java.util.Collection) {
-                        for (Object o : (java.util.Collection) bonded) {
-                            if (o instanceof BluetoothDevice && isBud((BluetoothDevice) o)) {
-                                holdGatt((BluetoothDevice) o);
-                            }
+                    if (sPeers != null) sPeers.stop();
+                    sPeers = new PeerOwnership(MAIN, new PeerOwnership.Listener() {
+                        @Override public void log(String message) { Core.log(message); }
+                        @Override public void yield(String address) {
+                            Object raw = invokeByName(sCtx, "getRemoteDevice", address);
+                            if (!(raw instanceof BluetoothDevice)) return;
+                            BluetoothDevice dev = (BluetoothDevice) raw;
+                            groupDevices(dev);
+                            sHandoff.yieldGroup(address);
+                            stopGroup(dev, "设备间独占接管");
                         }
-                    }
+                    });
+                    for (String address : new ArrayList<String>(sBuds)) sPeers.register(address);
+                    log("AdapterService 就绪：" + configLine());
+                    // GATT 持有者只能在目标耳机的 LE ACL 实际建立后挂载。启动阶段预先对所有已配对
+                    // 耳机 connectGatt 会抢占耳机的 LE ACL，导致其它手机无法接管连接。
                 } catch (Throwable t) {
                     log("onCreate 收尾异常: " + t);
                 }
@@ -1073,8 +1334,13 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
                 Object arg0 = p.args[0];
                 if (arg0 instanceof BluetoothDevice && isBud((BluetoothDevice) arg0)) {
                     int uid = android.os.Binder.getCallingUid();
-                    if (!BT_UID.equals(String.valueOf(uid))) {
-                        clearUserDisc("用户主动发起全量连接(uid=" + uid + ")");
+                    BluetoothDevice dev = (BluetoothDevice) arg0;
+                    if (isExplicitRequest()) {
+                        resumeGroup(dev, "用户主动发起全量连接(uid=" + uid + ")");
+                    } else if (isYielded(dev) || isUserDisc(dev)) {
+                        p.setResult(Integer.valueOf(0));
+                        log("拦系统自动全量连接，整组已暂停: " + dev);
+                        return;
                     }
                     repairClassicPolicy((BluetoothDevice) arg0, "全量连接");
                 }
@@ -1125,15 +1391,10 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
      * 清除时机：用户在设置里再点一次"连接"（同一个 uid!=1002 的判据），或蓝牙进程重启。
      */
     private static void markUserDisc(BluetoothDevice dev, String why) {
-        sUserDisc.add(dev.getAddress());
-        for (String a : new ArrayList<String>(sBuds)) {
-            sUserDisc.add(a);
-        }
+        groupDevices(dev);
+        sUserDisc.addAll(sHandoff.membersOf(dev.getAddress()));
         log(why + "：本进程内不再补拨/占链路/放行来向，地址=" + sUserDisc);
-        releaseHeld(dev.getAddress());
-        for (String a : new ArrayList<String>(sHeld.keySet())) {
-            releaseHeld(a);
-        }
+        stopGroup(dev, why);
     }
 
     private static void clearUserDisc(String why) {
@@ -1203,7 +1464,8 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         log("holdGatt 检查 " + addr + "：开关=" + on + " sCtx=" + (sCtx != null)
                 + " wantLea=" + lea + " 用户关LEA=" + sUserOffLea.contains(addr)
                 + " 用户主动断开=" + isUserDisc(dev));
-        if (!on || sCtx == null || !lea || isUserDisc(dev)) {
+        if (!on || sCtx == null || !lea || isPaused(dev)
+                || (!sLeAclConnected.contains(addr) && leaState(dev) != LEA_CONNECTED)) {
             return;
         }
         try {
@@ -1222,11 +1484,6 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("挂 GATT 持有者异常: " + t);
         }
-    }
-
-    /** 链路没了就把持有者忘掉，下一次连上重新挂 —— 不主动 close，close 本身就是扳机 */
-    private static void forgetGatt(String addr) {
-        sHeld.remove(addr);
     }
 
     /**
@@ -1248,8 +1505,14 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
         }
     }
 
-    /** 空回调：这个客户端唯一的用途就是占住 gatt_update_app_hold_link_status 的名额 */
+    /** 断开时必须注销 GATT 客户端，不能丢掉引用后让 native 继续持有。 */
     private static class Holder extends android.bluetooth.BluetoothGattCallback {
+        @Override public void onConnectionStateChange(android.bluetooth.BluetoothGatt gatt, int status, int state) {
+            if (state != LEA_DISCONNECTED) return;
+            String address = gatt.getDevice().getAddress();
+            if (sHeld.remove(address, gatt)) log("GATT 已断开，关闭持有者: " + address);
+            gatt.close();
+        }
     }
 
     private static Object sCb;
@@ -1265,13 +1528,10 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
             return true;
         }
         if (budNameHit(dev) != null) {
-            holdGatt(dev);
             return true;
         }
         return false;
     }
-
-
 
     /** 用户是否想要 LE Audio：策略允许 且 没在设置里手动关掉 */
     /** LE Audio 服务实例。AdapterService.onCreate 时它常常还没起来
@@ -1502,7 +1762,9 @@ public class Core implements de.robv.android.xposed.IXposedHookLoadPackage {
     private static final Map<String, String> sCfgCache = new HashMap<String, String>();
     private static long sCfgAt = 0;
 
-    private static String cfg(String key, String def) {
+    private static synchronized void invalidateConfig() { sCfgCache.clear(); }
+
+    private static synchronized String cfg(String key, String def) {
         try {
             long now = android.os.SystemClock.uptimeMillis();
             if (now - sCfgAt > 3000L) {
